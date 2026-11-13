@@ -1,0 +1,14 @@
+{
+  "name": "content/fac_helldivers/equipment/throwables/caltrops_grenade/materials/m_caltrops_beam_highlight.material",
+  "base": "tools/materials/m_cy_mine_highlight.material（208 字节 marker 材质）",
+  "emissive_intensity": 20.0,
+  "emissive_color": [
+    0.78,
+    0.561,
+    1.0
+  ],
+  "sha256": "4FCD9BCA988CEB3012DEEE27AB4B187A5078794BA653FB61CE7B68AEF5F26D5A",
+  "size": 208,
+  "note": "铁蒺藜：光柱（#C78FFF）",
+  "resource_id": "cc768e5234080763"
+}

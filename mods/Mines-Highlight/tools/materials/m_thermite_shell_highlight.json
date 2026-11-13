@@ -1,0 +1,14 @@
+{
+  "name": "content/fac_helldivers/equipment/throwables/mine_shark/materials/m_thermite_shell_highlight.material",
+  "base": "tools/materials/m_cy_mine_highlight.material（208 字节 marker 材质）",
+  "emissive_intensity": 15.0,
+  "emissive_color": [
+    1.0,
+    0.416,
+    0.118
+  ],
+  "sha256": "80F45498330DAC3D07C35E98A887BC59D3216319D8A50E04F6EFD43681B3A8C3",
+  "size": 208,
+  "note": "热熔地雷：高亮外壳（#FF6A1E）",
+  "resource_id": "d325a4682f43a90c"
+}

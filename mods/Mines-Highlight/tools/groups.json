@@ -1,0 +1,192 @@
+{
+  "source": "tools/source.zip（原始 patch 三件套，逐字节不可变）",
+  "target_build": "26568081",
+  "game_data": "E:/SteamLibrary/steamapps/common/Helldivers 2/data",
+  "method": "每个选项包含全部共享资源（27 texture + 4 material + 1 bones）加自己的 unit；GPU 文件使用源包完整副本，使 unit 的 r4/r5/r6 绝对引用仍然有效。新增地雷只需加一个 unit_index 或一条 standalone_options。",
+  "note": "引用链实测：contact #34→material #30→texture #24-26；incendiary #35→#27→#9-11；tank #33→#28→#18-20；gas #32→#29→#21-23。GPU 切片按 r4 定位且带对齐间隙，必须原样保留。",
+  "shared_indices": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31
+  ],
+  "groups": [
+    {
+      "key": "contact",
+      "label": "反步兵地雷 / MD-6 Anti-Personnel",
+      "unit": "contact_mine (ee89cc10d80b6afb)",
+      "unit_index": 34
+    },
+    {
+      "key": "incendiary",
+      "label": "燃烧地雷 / MD-I4 Incendiary",
+      "unit": "incendiary_mine (e49a5ae078aad407)",
+      "unit_index": 35
+    },
+    {
+      "key": "tank",
+      "label": "反坦克地雷 / MD-17 Anti-Tank",
+      "unit": "tank_mine (032489cf1d439bba)",
+      "unit_index": 33
+    },
+    {
+      "key": "gas",
+      "label": "毒气地雷 / MD-8 Gas",
+      "unit": "gas_mine (693028644d27ffef)",
+      "unit_index": 32
+    }
+  ],
+  "standalone_options": [
+    {
+      "key": "bot",
+      "source": "tools/source_bot.zip",
+      "patch": "9ba626afa44a3aa3.patch_87",
+      "unit": "content/env_cyborg/gameplay_structures/cy_mine_01",
+      "sha256": {
+        "patch": "CA4A0AF7162380DCEEFED6CCC40106531B2E82F62CE255E2383E51E65A436C7B",
+        "gpu": "BDC518D14D7843C7B89DC402B8544C7CB1A42BF4E84EA82B959F843788D8F261",
+        "stream": "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855"
+      },
+      "transform": "bot_patch",
+      "unit_highlight": "m_cy_mine_highlight (emissive 3.0, #FF2626)",
+      "emblem_removed": "beam group, 346 triangles degenerated",
+      "beam_height": "原始 4.7868 压到 3.829（-20%），与虫雷一致"
+    },
+    {
+      "key": "bug",
+      "source": "tools/source_bug.zip",
+      "patch": "新造 bundle（2 个 bug_cluster unit + 2 个材质 + 3 张贴图）",
+      "units": [
+        "content/env_bugs/assets/bug_web/bug_cluster_01",
+        "content/env_bugs/assets/bug_web/bug_cluster_02"
+      ],
+      "sha256": {
+        "bug_cluster_01": {
+          "main": "F21924010BA5BBBDFC7D093B7E97775B9E81B22AAF30087F8925BD877C80946F",
+          "gpu": "334AE4E2C338003E5EFEC350C8DE814B91D7B977186A3B8886B34E28C2BF547B"
+        },
+        "bug_cluster_02": {
+          "main": "0126DD1F68313F4516AF09CEFDE7F2C9B24F304555CC4CC138CDD11EFC9AB98C",
+          "gpu": "6431BBFE0838B689754517E3C383FCBE2E992A483E45122BCEE7F8731FAFFB82"
+        }
+      },
+      "transform": "bug_patch",
+      "unit_highlight": "m_bug_mine_highlight (emissive 15.0, #9EF238)",
+      "beam": "32 边圆柱、半径 0.042；大刺球高 3.829（独立 mesh），小刺球压到 70% 即 2.681（并进本体 mesh 的第二个组）",
+      "beam_ratios": {
+        "bug_cluster_01": 1.0,
+        "bug_cluster_02": 0.7
+      },
+      "beam_modes": {
+        "bug_cluster_01": "mesh",
+        "bug_cluster_02": "mesh"
+      }
+    },
+    {
+      "key": "thermite",
+      "label": "热熔地雷 / G/40-K Thermite Mine",
+      "source": "tools/source_mines.zip",
+      "units": [
+        "content/fac_helldivers/equipment/throwables/mine_shark/mine_shark"
+      ],
+      "sha256": {
+        "mine_shark": {
+          "main": "880EEA4DF4E8D0C59CE6DECA30BD368DE0FB977BFC582D5921A17C2A8B80B5AB",
+          "gpu": "9CD0C16CD4D3E52E5C8A1B8D32516A4A803DAC95A472064C7F5FB7BFAEDDFE2C"
+        }
+      },
+      "transform": "mine_patch",
+      "beam": {
+        "name": "content/fac_helldivers/equipment/throwables/mine_shark/materials/m_thermite_beam_highlight.material",
+        "file": "materials/m_thermite_beam_highlight.material",
+        "meta": "materials/m_thermite_beam_highlight.json"
+      },
+      "note": "本体材质与几何一字节不动；高亮是新增的一层放大 2% 的自发光外壳 mesh，光柱是另一个独立 mesh，两者各用一份材质。",
+      "shell": {
+        "name": "content/fac_helldivers/equipment/throwables/mine_shark/materials/m_thermite_shell_highlight.material",
+        "file": "materials/m_thermite_shell_highlight.material",
+        "meta": "materials/m_thermite_shell_highlight.json"
+      }
+    },
+    {
+      "key": "decoy",
+      "label": "诱饵地雷 / TM-1 Lure Mine",
+      "source": "tools/source_mines.zip",
+      "units": [
+        "content/fac_helldivers/equipment/throwables/luring_mine/luring_mine"
+      ],
+      "sha256": {
+        "luring_mine": {
+          "main": "DC834ADD79DE364E693C6C96D57E80AA67B9886B5D9619E9BCF0BA9BA0016698",
+          "gpu": "47A05ABA60B7FF4FA2DD0F8458F1001EB478B82C03F36F6E29985EEFE3C81BD1"
+        }
+      },
+      "transform": "mine_patch",
+      "beam": {
+        "name": "content/fac_helldivers/equipment/throwables/luring_mine/materials/m_luring_beam_highlight.material",
+        "file": "materials/m_luring_beam_highlight.material",
+        "meta": "materials/m_luring_beam_highlight.json"
+      },
+      "note": "本体材质与几何一字节不动；高亮是新增的一层放大 2% 的自发光外壳 mesh，光柱是另一个独立 mesh，两者各用一份材质。",
+      "shell": {
+        "name": "content/fac_helldivers/equipment/throwables/luring_mine/materials/m_luring_shell_highlight.material",
+        "file": "materials/m_luring_shell_highlight.material",
+        "meta": "materials/m_luring_shell_highlight.json"
+      }
+    },
+    {
+      "key": "caltrops",
+      "label": "铁蒺藜 / G-11 Caltrops",
+      "source": "tools/source_mines.zip",
+      "units": [
+        "content/fac_helldivers/equipment/throwables/caltrops_grenade/caltrops_mine"
+      ],
+      "sha256": {
+        "caltrops_mine": {
+          "main": "D4D3CCBCC7FC27CBE023603E46F3452EEF725AAEE432F24DFE234CDE86ABDD14",
+          "gpu": "4F5532E5CEA68AC01109FEFAB1A8BD84DD26140FF315C055D0020E359C43C2DF"
+        }
+      },
+      "transform": "mine_patch",
+      "beam": {
+        "name": "content/fac_helldivers/equipment/throwables/caltrops_grenade/materials/m_caltrops_beam_highlight.material",
+        "file": "materials/m_caltrops_beam_highlight.material",
+        "meta": "materials/m_caltrops_beam_highlight.json"
+      },
+      "note": "本体材质与几何一字节不动；高亮是新增的一层放大 2% 的自发光外壳 mesh，光柱是另一个独立 mesh，两者各用一份材质。",
+      "shell": {
+        "name": "content/fac_helldivers/equipment/throwables/caltrops_grenade/materials/m_caltrops_shell_highlight.material",
+        "file": "materials/m_caltrops_shell_highlight.material",
+        "meta": "materials/m_caltrops_shell_highlight.json"
+      }
+    }
+  ]
+}

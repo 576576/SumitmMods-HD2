@@ -1,0 +1,14 @@
+{
+  "name": "content/fac_helldivers/equipment/throwables/caltrops_grenade/materials/m_caltrops_shell_highlight.material",
+  "base": "tools/materials/m_cy_mine_highlight.material（208 字节 marker 材质）",
+  "emissive_intensity": 15.0,
+  "emissive_color": [
+    0.78,
+    0.561,
+    1.0
+  ],
+  "sha256": "C0FA2A0D31183C7C32048A574588924E38E904834C0B1C60144E6C9ED30D64A8",
+  "size": 208,
+  "note": "铁蒺藜：高亮外壳（#C78FFF）",
+  "resource_id": "bd72edcd609923ea"
+}

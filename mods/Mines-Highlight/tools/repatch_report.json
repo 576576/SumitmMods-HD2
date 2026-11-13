@@ -1,0 +1,158 @@
+{
+  "game_data": "E:\\SteamLibrary\\steamapps\\common\\Helldivers 2\\data",
+  "units_indexed": 8019,
+  "options": [
+    {
+      "key": "contact",
+      "changed_bytes": 0,
+      "unit_ranges": [
+        [
+          18256,
+          25132
+        ]
+      ],
+      "units": [
+        {
+          "unit": "ee89cc10d80b6afb",
+          "version": "0xa4cd36"
+        }
+      ]
+    },
+    {
+      "key": "incendiary",
+      "changed_bytes": 0,
+      "unit_ranges": [
+        [
+          18256,
+          23404
+        ]
+      ],
+      "units": [
+        {
+          "unit": "e49a5ae078aad407",
+          "version": "0xa4cd36"
+        }
+      ]
+    },
+    {
+      "key": "tank",
+      "changed_bytes": 0,
+      "unit_ranges": [
+        [
+          18256,
+          23576
+        ]
+      ],
+      "units": [
+        {
+          "unit": "032489cf1d439bba",
+          "version": "0xa4cd36"
+        }
+      ]
+    },
+    {
+      "key": "gas",
+      "changed_bytes": 0,
+      "unit_ranges": [
+        [
+          18256,
+          21380
+        ]
+      ],
+      "units": [
+        {
+          "unit": "693028644d27ffef",
+          "version": "0xa4cd36"
+        }
+      ]
+    },
+    {
+      "key": "bot",
+      "changed_bytes": 5,
+      "unit_ranges": [
+        [
+          2180,
+          3596
+        ]
+      ],
+      "units": [
+        {
+          "unit": "946f4ee6c568bc37",
+          "version": "0xa4cd36"
+        }
+      ]
+    },
+    {
+      "key": "bug",
+      "changed_bytes": 0,
+      "unit_ranges": [
+        [
+          2800,
+          11184
+        ],
+        [
+          11184,
+          18656
+        ]
+      ],
+      "units": [
+        {
+          "unit": "d31decfb096403cc",
+          "version": "0xa4cd36"
+        },
+        {
+          "unit": "7b0f61cbb2245f36",
+          "version": "0xa4cd36"
+        }
+      ]
+    },
+    {
+      "key": "thermite",
+      "changed_bytes": 0,
+      "unit_ranges": [
+        [
+          800,
+          17664
+        ]
+      ],
+      "units": [
+        {
+          "unit": "ee4c107b941ab7f4",
+          "version": "0xa4cd36"
+        }
+      ]
+    },
+    {
+      "key": "decoy",
+      "changed_bytes": 0,
+      "unit_ranges": [
+        [
+          800,
+          22416
+        ]
+      ],
+      "units": [
+        {
+          "unit": "a20683199dfc19e8",
+          "version": "0xa4cd36"
+        }
+      ]
+    },
+    {
+      "key": "caltrops",
+      "changed_bytes": 0,
+      "unit_ranges": [
+        [
+          800,
+          13616
+        ]
+      ],
+      "units": [
+        {
+          "unit": "c0b4502e67c7c867",
+          "version": "0xa4cd36"
+        }
+      ]
+    }
+  ]
+}

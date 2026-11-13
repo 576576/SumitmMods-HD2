@@ -1,0 +1,81 @@
+{
+  "Version": 1,
+  "Guid": "a7c4e2d1-3b8f-4c6a-9e52-7d1b0f8a4c93",
+  "Name": "Mines Highlight 1.0.1",
+  "IconPath": "thumbnail.png",
+  "Description": "每颗地雷与雷类战备都加上自发光高亮和竖直光柱，远处也能一眼看清；九个选项可分别勾选。 / Glowing highlights and vertical light beams on every mine, so you can spot them from a distance; nine options, each selectable.",
+  "Options": [
+    {
+      "Name": "反步兵地雷 / MD-6 Anti-Personnel",
+      "Description": "替换反步兵地雷（contact_mine）的资源。",
+      "Image": "images/contact.png",
+      "Include": [
+        "options/contact"
+      ]
+    },
+    {
+      "Name": "燃烧地雷 / MD-I4 Incendiary",
+      "Description": "替换燃烧地雷（incendiary_mine）的资源。",
+      "Image": "images/incendiary.png",
+      "Include": [
+        "options/incendiary"
+      ]
+    },
+    {
+      "Name": "反坦克地雷 / MD-17 Anti-Tank",
+      "Description": "替换反坦克地雷（tank_mine）的资源。",
+      "Image": "images/tank.png",
+      "Include": [
+        "options/tank"
+      ]
+    },
+    {
+      "Name": "毒气地雷 / MD-8 Gas",
+      "Description": "替换毒气地雷（gas_mine）的资源。",
+      "Image": "images/gas.png",
+      "Include": [
+        "options/gas"
+      ]
+    },
+    {
+      "Name": "热熔地雷 / G/40-K Thermite Mine",
+      "Description": "替换热熔地雷（mine_shark）的资源。",
+      "Image": "images/thermite.png",
+      "Include": [
+        "options/thermite"
+      ]
+    },
+    {
+      "Name": "诱饵地雷 / TM-1 Lure Mine",
+      "Description": "替换诱饵地雷（luring_mine）的资源。",
+      "Image": "images/decoy.png",
+      "Include": [
+        "options/decoy"
+      ]
+    },
+    {
+      "Name": "铁蒺藜 / G-11 Caltrops",
+      "Description": "替换铁蒺藜（caltrops_mine）的资源。",
+      "Image": "images/caltrops.png",
+      "Include": [
+        "options/caltrops"
+      ]
+    },
+    {
+      "Name": "机器人地雷 / Cyborg Mine",
+      "Description": "替换机器人地雷（cy_mine_01）的资源。",
+      "Image": "images/bot.png",
+      "Include": [
+        "options/bot"
+      ]
+    },
+    {
+      "Name": "终结族地雷 / Terminid Spore",
+      "Description": "替换终结族孢囊雷（bug_cluster_01/02）的资源。",
+      "Image": "images/bug.png",
+      "Include": [
+        "options/bug"
+      ]
+    }
+  ]
+}

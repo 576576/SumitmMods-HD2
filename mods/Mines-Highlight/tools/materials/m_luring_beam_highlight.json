@@ -1,0 +1,14 @@
+{
+  "name": "content/fac_helldivers/equipment/throwables/luring_mine/materials/m_luring_beam_highlight.material",
+  "base": "tools/materials/m_cy_mine_highlight.material（208 字节 marker 材质）",
+  "emissive_intensity": 20.0,
+  "emissive_color": [
+    1.0,
+    0.776,
+    0.239
+  ],
+  "sha256": "D69B063B730B06BE1B997050BEDC924B7DFDE0B564A4C88FA459879BD34E5F0D",
+  "size": 208,
+  "note": "诱饵地雷：光柱（#FFC63D）",
+  "resource_id": "6edf3f2664fabb2f"
+}

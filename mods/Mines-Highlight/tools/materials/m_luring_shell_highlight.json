@@ -1,0 +1,14 @@
+{
+  "name": "content/fac_helldivers/equipment/throwables/luring_mine/materials/m_luring_shell_highlight.material",
+  "base": "tools/materials/m_cy_mine_highlight.material（208 字节 marker 材质）",
+  "emissive_intensity": 15.0,
+  "emissive_color": [
+    1.0,
+    0.776,
+    0.239
+  ],
+  "sha256": "A609B1E481589669D246A3EFF24FBF8BE2BB755C5A464A682BE6FB6282586FF6",
+  "size": 208,
+  "note": "诱饵地雷：高亮外壳（#FFC63D）",
+  "resource_id": "a8ad1407cb48a5f8"
+}

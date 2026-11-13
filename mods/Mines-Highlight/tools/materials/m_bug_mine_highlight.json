@@ -1,0 +1,12 @@
+{
+  "name": "content/env_bugs/assets/bug_hive/materials/m_bug_mine_highlight.material",
+  "base_material": "ef050126eedc3e05",
+  "emissive_intensity": 15.0,
+  "base_color": [
+    0.62,
+    0.95,
+    0.22
+  ],
+  "derived_from": "tools/materials/m_cy_mine_highlight.material (同一基础材质，只改颜色三元组)",
+  "sha256": "0C7EBC8D8310BA9374F11A2D0D2748A414EDC239B0DDFE67A80FFD6339FA19AC"
+}

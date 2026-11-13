@@ -1,0 +1,12 @@
+{
+  "name": "content/env_bugs/assets/bug_web/materials/m_bug_beam_highlight.material",
+  "base": "m_bug_mine_highlight（208 字节 marker 材质）",
+  "emissive_intensity": 20.0,
+  "emissive_color": [
+    0.55,
+    1.0,
+    0.35
+  ],
+  "sha256": "CFD699AC385F18709CC5AF4790B5277D0F7F81E946D074ED3344268FE74C293A",
+  "size": 208
+}
