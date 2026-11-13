@@ -1,0 +1,15 @@
+# 统一换行；二进制资源按原样存
+* text=auto
+
+*.py text eol=lf
+*.lua text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.txt text eol=lf
+
+*.png binary
+*.exe binary
+*.patch_0 binary
+*.gpu_resources binary
+*.stream binary
+*.dl_bin binary

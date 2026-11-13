@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+
+# 构建产物与中间缓存（任意层级）
+build/
+dist/
+out/
+
+# 本地会话缓存
+.workbuddy/
+
+# 系统垃圾
+.DS_Store
+Thumbs.db
