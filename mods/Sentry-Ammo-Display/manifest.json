@@ -1,0 +1,57 @@
+{
+  "Version": 1,
+  "Guid": "7a75be80-edbd-49a1-befe-477043c4ef5d",
+  "Name": "炮塔阵地弹药显示 MDL3版 1.5.0",
+  "Description": "去掉自带加载器与 boot 脚本，弹药核心由 MDL3 直接挂载；保留原弹药读取、四格条、热量、电塔倒计时、遮挡、图标与 14 项设置。需要已安装 MDL3 dev.32 或更新版本。",
+  "Options": [
+    {
+      "Name": "核心（必选）",
+      "Description": "弹药读取与头顶显示本体。不勾这一项，下面几组装了也不会有任何显示。",
+      "Image": "thumbnail.png",
+      "Include": [
+        "core"
+      ]
+    },
+    {
+      "Name": "实弹哨戒（机枪 / 加特林 / 自动 / 火箭 / 火焰）",
+      "Description": "显示机枪 / 加特林 / 自动 / 火箭 / 火焰的头顶弹药。可与其他组同时勾选。",
+      "Image": "images/group_ammo.png",
+      "Include": [
+        "groups/ammo"
+      ]
+    },
+    {
+      "Name": "迫击炮（迫击 / 电磁迫击 / 毒气迫击）",
+      "Description": "显示迫击 / 电磁迫击 / 毒气迫击的头顶弹药。可与其他组同时勾选。",
+      "Image": "images/group_mortar.png",
+      "Include": [
+        "groups/mortar"
+      ]
+    },
+    {
+      "Name": "激光哨戒",
+      "Description": "显示激光哨戒的头顶弹药。可与其他组同时勾选。",
+      "Image": "images/group_laser.png",
+      "Include": [
+        "groups/laser"
+      ]
+    },
+    {
+      "Name": "特斯拉塔",
+      "Description": "显示特斯拉塔的头顶弹药。可与其他组同时勾选。",
+      "Image": "images/group_tesla.png",
+      "Include": [
+        "groups/tesla"
+      ]
+    },
+    {
+      "Name": "阵地（重机枪 / 反坦克 / 榴弹兵墙）",
+      "Description": "显示重机枪 / 反坦克 / 榴弹兵墙的头顶弹药。可与其他组同时勾选。",
+      "Image": "images/group_emplacement.png",
+      "Include": [
+        "groups/emplacement"
+      ]
+    }
+  ],
+  "IconPath": "thumbnail.png"
+}

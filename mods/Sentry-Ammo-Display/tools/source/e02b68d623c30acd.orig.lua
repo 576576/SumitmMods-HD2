@@ -1,0 +1,3106 @@
+local SENTRY_ADDON='mods/codex/sentry_ammo_overhead'
+local ot=...
+local S=ot.engine
+local App,Unit=S.Application or {},S.Unit or {}
+local VERSION='1.4.5'
+local create_network = (function()
+-- Read-only ammunition/temperature and explicitly estimated Tesla lifetime provider.
+-- factory(ot, profile, identity) -> reset(world), sample(unit, model_hash), forget(unit),
+-- shutdown(), status(). No game memory access, setters, or spawning.
+--
+-- profile.types: dense list of schema entries. Legacy rounds_slot means ammo;
+-- metric_kind=heat uses temperature and explicit FLOAT schema bounds. Static
+-- heat thresholds normalize an explicitly estimated percentage, never a verified max.
+-- lifetime uses a static duration from first verified observation, not actual birth.
+-- profile.models: normalized .unit hash -> true/name, the sentry whitelist.
+-- profile.steam_build/schema_sha256 are provenance, not proof of live success.
+--
+-- An existing bidirectional UnitSynchronizer mapping takes priority. An optional
+-- identity provider may instead supply a same-frame inference from a proven
+-- static model/type binding and a complete, unique vector match. That inference
+-- is reported separately from a native mapping and still needs live validation.
+-- Both paths require the current session, object type, and complete field schema
+-- to match before reading raw rounds/temperature or updating a lifetime estimate.
+-- No synchronizer creation/configuration is performed here.
+--
+-- Official contracts:
+-- https://help.autodesk.com/cloudhelp/ENU/Stingray-Help/lua_ref/obj_stingray_UnitSynchronizer.html
+-- https://help.autodesk.com/cloudhelp/ENU/Stingray-Help/lua_ref/obj_stingray_GameSession.html
+-- https://help.autodesk.com/cloudhelp/ENU/Stingray-Help/lua_ref/ns_stingray_Network.html
+-- https://help.autodesk.com/cloudhelp/ENU/Stingray-Help/lua_ref/tab_network__type__info.html
+-- Field hashes: rounds_remaining=d7a5d63e, temperature=a5023836 (Murmur64 high32).
+return function(ot, profile, identity)
+    ot=type(ot)=='table' and ot or {}
+    profile=type(profile)=='table' and profile or {}
+    identity=type(identity)=='table' and identity or nil
+    local S=type(ot.engine)=='table' and ot.engine or {}
+    local App,Unit,V3=S.Application or {},S.Unit or {},S.Vector3 or {}
+    local Net,GS,US=S.Network or {},S.GameSession or {},S.UnitSynchronizer or {}
+    local METRICS={
+        ammo={field='rounds_remaining',hash='d7a5d63e',source='network.rounds_remaining'},
+        heat={field='temperature',hash='a5023836',source='network.temperature'},
+        lifetime={source='estimated.deployment_remaining'}
+    }
+    local PER_SAMPLE,PER_FRAME,DISCOVERY_SECONDS=4,8,0.0005
+    local CACHE_LIMIT=256
+    local world,context,last_session=nil,nil,nil
+    local lifetime_last_time=nil
+    local cache,cache_count,schemas={},0,{}
+    local reason='no_world'
+    local call_detail=nil
+    local sync_state='not_checked'
+    local mapping_seen,positional_used,rounds_seen,temperature_seen=false,false,false,false
+    local identity_problem,identity_ready=nil,false
+    local count={sampled=0,returned=0,ammo_returned=0,heat_returned=0,lifetime_returned=0,type_checks=0,schema_checks=0,errors=0}
+    local logged={}
+    local missing={}
+    local function finite(v)
+        return type(v)=='number' and v==v and v>-math.huge and v<math.huge
+    end
+    local function integer(v,lo,hi)
+        return finite(v) and v%1==0 and v>=lo and v<=hi
+    end
+    local function hash32(value)
+        if type(value)=='userdata' then
+            local ok,text=pcall(tostring,value)
+            if not ok then return nil end
+            value=text
+        end
+        if type(value)~='string' then return nil end
+        local hex=value:lower():gsub('^0x','')
+        if not hex:match('^%x+$') or #hex>8 then return nil end
+        return string.rep('0',8-#hex)..hex
+    end
+    local function model_hash(value)
+        if type(value)~='string' then return nil end
+        local hex=value:match('#ID%[(%x+)%]')
+        if not hex then return nil end
+        hex=hex:lower():gsub('^0+','')
+        return hex~='' and hex or '0'
+    end
+    local function required(name,fn)
+        if type(fn)~='function' then missing[#missing+1]=name end
+    end
+    required('Application.worlds',App.worlds)
+    required('Unit.alive',Unit.alive)
+    required('Unit.world',Unit.world)
+    required('Unit.debug_name',Unit.debug_name)
+    required('Unit.world_position',Unit.world_position)
+    required('Vector3.to_elements',V3.to_elements)
+    required('Network.game_session',Net.game_session)
+    required('Network.object_info',Net.object_info)
+    required('GameSession.game_object_exists',GS.game_object_exists)
+    required('GameSession.game_object_is_type',GS.game_object_is_type)
+    required('GameSession.game_object_field',GS.game_object_field)
+    required('ot.frame',ot.frame)
+    required('ot.clock',ot.clock)
+    if type(Net.INT)~='number' then missing[#missing+1]='Network.INT' end
+    local sync_available=type(GS.unit_synchronizer)=='function'
+        and type(US.unit_to_game_object_id)=='function'
+        and type(US.game_object_id_to_unit)=='function'
+    local types,types_by_hash,models={},{},profile.models
+    local profile_problem=nil
+    if type(models)~='table' or type(profile.types)~='table'
+        or #profile.types<1 or #profile.types>4096 then
+        profile_problem='missing_network_profile'
+    else
+        local seen={}
+        for i=1,#profile.types do
+            local entry=profile.types[i]
+            local id=type(entry)=='table' and hash32(entry.type_hash)
+            if not id or type(entry.call)~='string' or #entry.call<1
+                or #entry.call>128 or seen[id] then
+                profile_problem='invalid_network_profile'
+                break
+            end
+            local metric_kind=entry.metric_kind or 'ammo'
+            local metric=METRICS[metric_kind]
+            local metric_slot=entry.metric_slot or entry.rounds_slot
+            if not metric then profile_problem='unsupported_profile_metric';break end
+            local fields={}
+            if type(entry.fields)~='table' or #entry.fields<1 or #entry.fields>4096
+                or (metric_kind~='lifetime' and not integer(metric_slot,1,#entry.fields)) then
+                profile_problem='invalid_network_field_profile'
+                break
+            end
+            local metric_count=0
+            for slot=1,#entry.fields do
+                fields[slot]=hash32(entry.fields[slot])
+                if not fields[slot] then profile_problem='invalid_network_field_profile';break end
+                if fields[slot]==metric.hash then metric_count=metric_count+1 end
+            end
+            if profile_problem then break end
+            if metric_kind~='lifetime' and (metric_count~=1 or fields[metric_slot]~=metric.hash) then
+                profile_problem=metric_kind=='ammo' and 'invalid_profile_rounds_slot' or 'invalid_profile_temperature_slot'
+                break
+            end
+            if metric_kind=='heat' and (entry.schema_bits~=7 or entry.schema_min~=0
+                or entry.schema_max~=4000 or not finite(entry.static_heat_threshold)
+                or entry.static_heat_threshold<=0) then
+                profile_problem='invalid_profile_temperature_bounds';break
+            end
+            if metric_kind=='lifetime' and (not finite(entry.estimated_lifetime_seconds)
+                or entry.estimated_lifetime_seconds<=0 or entry.estimated_lifetime_seconds>86400
+                or entry.metric_slot~=nil or entry.rounds_slot~=nil) then
+                profile_problem='invalid_profile_lifetime_estimate';break
+            end
+            seen[id]=true
+            local validated={call=entry.call,type_hash=id,fields=fields,rounds_slot=entry.rounds_slot,
+                metric_kind=metric_kind,metric=metric,metric_slot=metric_slot,
+                schema_bits=entry.schema_bits,schema_min=entry.schema_min,schema_max=entry.schema_max,
+                static_heat_threshold=metric_kind=='heat' and entry.static_heat_threshold or nil,
+                estimated_lifetime_seconds=metric_kind=='lifetime' and entry.estimated_lifetime_seconds or nil}
+            types[#types+1]=validated
+            types_by_hash[id]=validated
+        end
+    end
+    -- Independently constrain inferred records to the static model/type pairs.
+    -- Missing bindings disable this path only; a real native mapping can work
+    -- without a coordinate-based association.
+    local binding_types,binding_problem={},nil
+    if type(profile.bindings)~='table' or #profile.bindings<1 or #profile.bindings>256 then
+        binding_problem='static_bindings_unavailable'
+    else
+        for _,binding in ipairs(profile.bindings) do
+            local mh=type(binding)=='table' and binding.model_hash
+            if type(mh)=='string' then
+                mh=mh:lower():gsub('^0x','')
+                if mh:match('^%x+$') and #mh<=16 then
+                    mh=mh:gsub('^0+','')
+                    if mh=='' then mh='0' end
+                else mh=nil end
+            else mh=nil end
+            local id=type(binding)=='table' and hash32(binding.type_hash)
+            local entry=id and types_by_hash[id]
+            if not mh or type(models)~='table' or not models[mh] or not entry or binding.call~=entry.call
+                or type(binding.fields)~='table' or #binding.fields~=#entry.fields then
+                binding_problem='invalid_static_bindings'
+                break
+            end
+            for slot=1,#entry.fields do
+                if hash32(binding.fields[slot])~=entry.fields[slot] then
+                    binding_problem='static_binding_schema_mismatch'
+                    break
+                end
+            end
+            if binding_problem then break end
+            binding_types[mh]=binding_types[mh] or {}
+            binding_types[mh][id]=true
+        end
+    end
+    local function note(key,message)
+        if logged[key] then return end
+        logged[key]=true
+        if type(ot.log)=='function' then pcall(ot.log,'SENTRY-NETWORK %s',message) end
+    end
+    -- Record the first native mapping calls in the loader's crash journal.
+    -- A Lua pcall cannot catch native failures; a failed prior launch can skip
+    -- this path on the next launch instead of repeating it.
+    local function native(key,fn,...)
+        if type(ot.risky)=='function' then
+            return ot.risky('network.'..key,fn,...)
+        end
+        return pcall(fn,...)
+    end
+    local function call_problem(key,ok,value)
+        local detail
+        if not ok then
+            detail='error: '..tostring(value):gsub('[%c]',' '):sub(1,240)
+        elseif value==nil then
+            detail='returned nil'
+        else
+            detail='returned '..type(value)..': '..tostring(value):gsub('[%c]',' '):sub(1,120)
+        end
+        call_detail=key..': '..detail
+        note('call:'..key..':'..(ok and 'returned' or 'error'),call_detail)
+        return detail
+    end
+    local function fail(value)
+        reason=value
+        return nil,value
+    end
+    local function forget(unit)
+        if cache[unit]~=nil then cache[unit]=nil;cache_count=cache_count-1 end
+    end
+    local function forget_unknown(unit)
+        local row=cache[unit]
+        -- This preserves only an already-established estimate origin. It never
+        -- authorizes a sample: every later return still validates current identity,
+        -- session, existence, type, schema, clock and position again.
+        if row and row.kind and row.kind.metric_kind=='lifetime'
+            and finite(row.lifetime_started) and row.lifetime_type==row.kind.type_hash then return end
+        forget(unit)
+    end
+    local function forget_unknown_rows()
+        local units={}
+        for unit in pairs(cache) do units[#units+1]=unit end
+        for _,unit in ipairs(units) do forget_unknown(unit) end
+    end
+    local function clear_session()
+        cache,schemas,cache_count={}, {},0
+        mapping_seen,positional_used,rounds_seen,temperature_seen=false,false,false,false
+        sync_state='not_checked'
+        lifetime_last_time=nil
+    end
+    local function current_context()
+        local ok,frame=pcall(ot.frame)
+        if not ok or not integer(frame,0,9007199254740991) then
+            return nil,'frame_unavailable'
+        end
+        if context and context.frame==frame then return context,context.problem end
+        local tick_ok,tick=pcall(ot.clock)
+        context={frame=frame,checks=0,discovery_elapsed=0}
+        if not tick_ok or not finite(tick) then
+            context.problem='clock_unavailable';return context,context.problem
+        end
+        local worlds_ok,worlds=pcall(App.worlds)
+        local live=false
+        if worlds_ok and type(worlds)=='table' then
+            for _,candidate in pairs(worlds) do if candidate==world then live=true;break end end
+        end
+        if not live then
+            if worlds_ok and type(worlds)=='table' then clear_session();last_session=nil end
+            context.problem='world_unavailable';return context,context.problem
+        end
+        local session_ok,session=pcall(Net.game_session)
+        if not session_ok or session==nil then
+            forget_unknown_rows()
+            context.problem='session_unavailable';return context,context.problem
+        end
+        if session~=last_session then
+            clear_session()
+            last_session=session
+        end
+        context.session=session
+        if not sync_available then
+            sync_state='api_missing'
+            context.sync_problem='synchronizer_api_unavailable'
+            return context
+        end
+        local sync_ok,sync=native('unit_synchronizer',GS.unit_synchronizer,session)
+        if not sync_ok or sync==nil then
+            sync_state=sync_ok and 'returned_nil' or 'call_error'
+            call_problem('GameSession.unit_synchronizer',sync_ok,sync)
+            context.sync_problem=sync_ok and 'synchronizer_returned_nil' or 'synchronizer_call_error'
+            return context
+        end
+        sync_state='available'
+        context.sync=sync
+        return context
+    end
+    local function budget_available(ctx)
+        if ctx.checks>=PER_FRAME or ctx.discovery_elapsed>=DISCOVERY_SECONDS then return false end
+        local ok,tick=pcall(ot.clock)
+        return ok and finite(tick),tick
+    end
+    local function charge_discovery(ctx,started)
+        local ok,tick=pcall(ot.clock)
+        if not ok or not finite(tick) or tick<started then
+            ctx.discovery_elapsed=math.huge
+        else
+            ctx.discovery_elapsed=ctx.discovery_elapsed+(tick-started)
+        end
+    end
+    local function schema(entry)
+        local known=schemas[entry.type_hash]
+        if known then return known,known.problem end
+        count.schema_checks=count.schema_checks+1
+        local ok,info=pcall(Net.object_info,entry.call)
+        if not ok or type(info)~='table' or type(info.fields)~='table' then
+            return nil,'schema_unavailable'
+        end
+        local result={}
+        local total=0
+        for slot,_ in pairs(info.fields) do
+            total=total+1
+            if total>#entry.fields or not integer(slot,1,#entry.fields) then
+                result.problem='network_schema_shape_mismatch'
+                break
+            end
+        end
+        if not result.problem and total~=#entry.fields then
+            result.problem='network_schema_shape_mismatch'
+        end
+        if not result.problem then
+            for slot=1,#entry.fields do
+                local field=info.fields[slot]
+                if type(field)~='table' or hash32(field.id)~=entry.fields[slot] then
+                    result.problem='network_schema_fields_mismatch'
+                    break
+                end
+            end
+        end
+        if result.problem then
+            schemas[entry.type_hash]=result
+            return result,result.problem
+        end
+        if entry.metric_kind=='lifetime' then
+            -- The complete object schema is validated, but no field is claimed
+            -- to encode deployment time. The value below is explicitly estimated.
+            schemas[entry.type_hash]=result
+            return result
+        end
+        local found=info.fields[entry.metric_slot]
+        local heat=entry.metric_kind=='heat'
+        if not found then result.problem=heat and 'temperature_not_declared' or 'rounds_not_declared'
+        elseif heat and type(Net.FLOAT)~='number' then result.problem='temperature_float_api_unavailable'
+        elseif found.type~=(heat and Net.FLOAT or Net.INT) then
+            result.problem=heat and 'temperature_not_float_schema' or 'rounds_not_integer_schema'
+        elseif not integer(found.bits,1,53) then
+            result.problem=heat and 'invalid_temperature_bits' or 'invalid_rounds_bits'
+        elseif not finite(found.min) or not finite(found.max) or found.min>found.max then
+            result.problem=heat and 'invalid_temperature_bounds' or 'invalid_rounds_bounds'
+        elseif heat and (found.bits~=entry.schema_bits or found.min~=entry.schema_min or found.max~=entry.schema_max) then
+            result.problem='temperature_schema_bounds_mismatch'
+        else
+            result.minimum=found.min
+            result.maximum=found.max
+            result.bits=found.bits
+        end
+        schemas[entry.type_hash]=result
+        return result,result.problem
+    end
+    local function find_type(ctx,goid,row)
+        if row.kind then
+            local ok,match=pcall(GS.game_object_is_type,ctx.session,goid,row.kind.call)
+            if not ok or type(match)~='boolean' then count.errors=count.errors+1;return nil,'type_check_failed' end
+            if match==true then return row.kind end
+            row.kind=nil
+            row.lifetime_started=nil
+            row.lifetime_type=nil
+            row.next_type=1
+        end
+        if row.next_type>#types then return nil,'object_type_outside_profile' end
+        local checked=0
+        while row.next_type<=#types and checked<PER_SAMPLE do
+            local allowed,started=budget_available(ctx)
+            if not allowed then return nil,'type_discovery_budget' end
+            local entry=types[row.next_type]
+            row.next_type=row.next_type+1
+            ctx.checks=ctx.checks+1
+            checked=checked+1
+            count.type_checks=count.type_checks+1
+            local ok,match=pcall(GS.game_object_is_type,ctx.session,goid,entry.call)
+            charge_discovery(ctx,started)
+            if not ok or type(match)~='boolean' then
+                -- An unreadable check is not evidence that the type differs.
+                row.next_type=row.next_type-1
+                count.errors=count.errors+1
+                return nil,'type_check_failed'
+            end
+            if match==true then row.kind=entry;return entry end
+        end
+        return nil,row.next_type>#types and 'object_type_outside_profile' or 'discovering_object_type'
+    end
+    local api={}
+    function api.reset(next_world)
+        world=next_world
+        call_detail=nil
+        context,last_session=nil,nil
+        clear_session()
+        logged={}
+        identity_ready=false
+        identity_problem=nil
+        if identity and type(identity.reset)=='function' and type(identity.resolve)=='function' then
+            local ok,err=pcall(identity.reset,next_world)
+            identity_ready=ok
+            if not ok then
+                identity_problem='identity_reset_failed'
+                call_problem('identity.reset',ok,err)
+            end
+        elseif identity then
+            identity_problem='identity_api_unavailable'
+        end
+        reason=world and 'native_mapping_unverified' or 'no_world'
+    end
+    function api.sample(unit,expected_model)
+        count.sampled=count.sampled+1
+        if world==nil then return fail('no_world') end
+        if profile_problem then return fail(profile_problem) end
+        if #missing>0 then
+            note('api','unavailable: '..table.concat(missing,', '))
+            return fail('api_unavailable')
+        end
+        if type(unit)~='userdata' then return fail('invalid_unit') end
+        local ctx,problem=current_context()
+        if not ctx or problem then return fail(problem or 'context_unavailable') end
+        local ok,alive=pcall(Unit.alive,unit)
+        if not ok or type(alive)~='boolean' then forget_unknown(unit);return fail('unit_liveness_unavailable') end
+        if alive==false then forget(unit);return fail('unit_destroyed') end
+        local world_ok,unit_world=pcall(Unit.world,unit)
+        if not world_ok or unit_world==nil then forget_unknown(unit);return fail('unit_world_unavailable') end
+        if unit_world~=world then forget(unit);return fail('unit_world_mismatch') end
+        local name_ok,name=pcall(Unit.debug_name,unit)
+        local actual=name_ok and model_hash(name)
+        if not actual then forget_unknown(unit);return fail('unit_model_unavailable') end
+        if cache[unit] and cache[unit].model~=actual then forget(unit) end
+        if not models[actual] or actual~=expected_model then
+            forget_unknown(unit);return fail('unit_not_in_sentry_profile')
+        end
+        local goid,basis,fallback_kind
+        local retained_identity,established_frame=false,nil
+        local mapping_problem=ctx.sync_problem
+        if ctx.sync~=nil then
+            local id_ok,id=native('unit_to_game_object_id',US.unit_to_game_object_id,ctx.sync,unit)
+            if not id_ok or not integer(id,0,2147483647) or id==32767 then
+                call_problem('UnitSynchronizer.unit_to_game_object_id',id_ok,id)
+                mapping_problem=not id_ok and 'unit_mapping_call_error' or 'unit_has_no_network_mapping'
+            else
+                local unit_ok,mapped=native('game_object_id_to_unit',US.game_object_id_to_unit,ctx.sync,id)
+                if not unit_ok or mapped~=unit then
+                    call_problem('UnitSynchronizer.game_object_id_to_unit',unit_ok,mapped)
+                    mapping_problem=not unit_ok and 'reverse_mapping_call_error' or 'network_mapping_not_exact'
+                else
+                    goid,basis=id,'native_bidirectional_unit_mapping'
+                end
+            end
+        end
+        if goid==nil and identity_ready then
+            local resolved_ok,resolved,resolution_problem=pcall(identity.resolve,unit,actual)
+            if not resolved_ok then
+                identity_problem='identity_resolve_failed'
+                call_problem('identity.resolve',resolved_ok,resolved)
+            elseif resolved==nil then
+                identity_problem=type(resolution_problem)=='string' and resolution_problem or 'identity_unavailable'
+            elseif type(resolved)~='table' then
+                identity_problem='identity_record_invalid'
+            elseif resolved.session~=ctx.session or resolved.frame~=ctx.frame then
+                identity_problem='identity_context_mismatch'
+            elseif resolved.identity_basis~='static_type_and_unique_vector_match' then
+                identity_problem='identity_basis_invalid'
+            elseif not integer(resolved.goid,0,2147483647) or resolved.goid==32767 then
+                identity_problem='identity_object_invalid'
+            else
+                local entry=types_by_hash[hash32(resolved.type_hash)]
+                if not entry or resolved.call~=entry.call then
+                    identity_problem='identity_type_outside_profile'
+                elseif binding_problem then
+                    identity_problem=binding_problem
+                elseif not binding_types[actual] or not binding_types[actual][entry.type_hash] then
+                    identity_problem='identity_model_type_mismatch'
+                else
+                    goid,basis,fallback_kind=resolved.goid,resolved.identity_basis,entry
+                    retained_identity=resolved.identity_retained==true
+                    established_frame=resolved.identity_established_frame
+                    identity_problem=nil
+                end
+            end
+        end
+        if goid==nil then
+            forget_unknown(unit)
+            return fail(identity_problem or mapping_problem or 'unit_has_no_network_mapping')
+        end
+        local exists_ok,exists=pcall(GS.game_object_exists,ctx.session,goid)
+        if not exists_ok or type(exists)~='boolean' then
+            forget_unknown(unit);return fail('network_object_existence_unavailable')
+        end
+        if exists==false then forget(unit);return fail('network_object_gone') end
+        if basis=='native_bidirectional_unit_mapping' then mapping_seen=true end
+        local row=cache[unit]
+        if row==nil then
+            if cache_count>=CACHE_LIMIT then return fail('unit_cache_full') end
+            row={goid=goid,model=actual,next_type=1}
+            cache[unit]=row
+            cache_count=cache_count+1
+        elseif row.goid~=goid or row.model~=actual then
+            row={goid=goid,model=actual,next_type=1}
+            cache[unit]=row
+        end
+        -- resolve() must supply current-frame validation of the original pair.
+        -- Persistent identity never authorizes reusing ammo: rounds below are
+        -- always read again from this frame's checked object.
+        local kind,type_problem
+        if fallback_kind then
+            count.type_checks=count.type_checks+1
+            local type_ok,match=pcall(GS.game_object_is_type,ctx.session,goid,fallback_kind.call)
+            if not type_ok or type(match)~='boolean' then
+                count.errors=count.errors+1
+                return fail('type_check_failed')
+            end
+            if match~=true then forget(unit);return fail('identity_type_mismatch') end
+            kind=fallback_kind
+            if row.kind and row.kind.type_hash~=kind.type_hash then
+                row.lifetime_started=nil;row.lifetime_type=nil
+                row.aux_frame=nil;row.metric_log_frame=nil
+            end
+            row.kind=kind
+        else
+            kind,type_problem=find_type(ctx,goid,row)
+            if not kind then return fail(type_problem) end
+            identity_problem=nil
+        end
+        local declared,schema_problem=schema(kind)
+        if not declared or schema_problem then return fail(schema_problem or 'schema_unavailable') end
+        local heat=kind.metric_kind=='heat'
+        local lifetime=kind.metric_kind=='lifetime'
+        local value,lifetime_now
+        if lifetime then
+            local time_ok,now=pcall(function() return type(ot.time)=='function' and ot.time() or nil end)
+            if not time_ok or not finite(now) or now<0 then
+                return fail('lifetime_clock_unavailable')
+            end
+            if lifetime_last_time~=nil and now<lifetime_last_time then
+                -- A backwards game clock invalidates every prior observation in
+                -- this session, including other Tesla units not sampled yet.
+                for _,cached in pairs(cache) do
+                    cached.lifetime_started=nil;cached.lifetime_type=nil
+                    cached.lifetime_log_frame=nil
+                end
+            end
+            lifetime_last_time=now
+            lifetime_now=now
+        else
+            local value_ok
+            value_ok,value=pcall(GS.game_object_field,ctx.session,goid,kind.metric.field)
+            if not value_ok then
+                count.errors=count.errors+1
+                return fail(heat and 'temperature_read_failed' or 'rounds_read_failed')
+            end
+            local value_valid=finite(value)
+            if not heat then value_valid=integer(value,0,2147483647) end
+            if not value_valid or value<0 or value<declared.minimum or value>declared.maximum then
+                return fail(heat and 'temperature_unavailable_or_invalid' or 'rounds_unavailable_or_invalid')
+            end
+        end
+        local pos_ok,position=pcall(Unit.world_position,unit,1)
+        if not pos_ok or position==nil then return fail('position_unavailable') end
+        local xyz_ok,x,y,z=pcall(V3.to_elements,position)
+        if not xyz_ok or not finite(x) or not finite(y) or not finite(z) then
+            return fail('position_invalid')
+        end
+        if lifetime then
+            if row.lifetime_started==nil or row.lifetime_type~=kind.type_hash then
+                row.lifetime_started=lifetime_now
+                row.lifetime_type=kind.type_hash
+                row.lifetime_log_frame=nil
+            end
+            value=math.max(0,kind.estimated_lifetime_seconds-(lifetime_now-row.lifetime_started))
+        end
+        -- Diagnostic fields never alter the displayed raw rounds. Their own
+        -- sample frame is recorded because these optional reads are throttled.
+        if not lifetime and (not row.aux_frame or ctx.frame-row.aux_frame>=120) then
+            row.aux_frame=ctx.frame
+            row.aux={}
+            local optional={ec64918b='magazines_remaining',['4a893e74']='chamber_empty',f6275c53='is_overheated'}
+            for _,field_hash in ipairs(kind.fields) do
+                local field_name=optional[field_hash]
+                if field_name then
+                    local extra_ok,extra=pcall(GS.game_object_field,ctx.session,goid,field_name)
+                    if extra_ok and (type(extra)=='boolean' or finite(extra)) then row.aux[field_name]=extra end
+                end
+            end
+        end
+        if heat then
+            temperature_seen=true;count.heat_returned=count.heat_returned+1
+            -- Observed extrema are diagnostics only. They never become a
+            -- capacity, ratio, forecast, or display maximum.
+            row.temperature_min=math.min(row.temperature_min or value,value)
+            row.temperature_max=math.max(row.temperature_max or value,value)
+            if not row.metric_log_frame or ctx.frame-row.metric_log_frame>=120 then
+                row.metric_log_frame=ctx.frame
+                if type(ot.log)=='function' then
+                    pcall(ot.log,'SENTRY-HEAT type=%s goid=%s temperature=%.3f observed_min=%.3f observed_max=%.3f static_threshold=%.3f metric_max_verified=false frame=%s',
+                        kind.type_hash,tostring(goid),value,row.temperature_min,row.temperature_max,
+                        kind.static_heat_threshold,tostring(ctx.frame))
+                end
+            end
+        elseif lifetime then
+            count.lifetime_returned=count.lifetime_returned+1
+            if not row.lifetime_log_frame or ctx.frame-row.lifetime_log_frame>=120 then
+                row.lifetime_log_frame=ctx.frame
+                if type(ot.log)=='function' then
+                    pcall(ot.log,'SENTRY-LIFETIME type=%s goid=%s remaining_estimate=%.3f first_verified_observation=%.3f observed_age=%.3f static_lifetime=%.3f metric_max_verified=false basis=first_verified_observation frame=%s',
+                        kind.type_hash,tostring(goid),value,row.lifetime_started,lifetime_now-row.lifetime_started,
+                        kind.estimated_lifetime_seconds,tostring(ctx.frame))
+                end
+            end
+        else rounds_seen=true;count.ammo_returned=count.ammo_returned+1 end
+        if basis=='static_type_and_unique_vector_match' then positional_used=true end
+        count.returned=count.returned+1
+        reason=lifetime and 'estimated_lifetime_from_first_observation' or heat and 'sampled_network_temperature' or 'sampled_network_rounds'
+        note('sample:'..kind.type_hash..':'..basis,(lifetime and 'estimated lifetime from first verified observation' or 'sampled declared '..kind.metric.field)..'; identity='..basis..'; type='..kind.type_hash)
+        local result={verified=true,unit=unit,world=world,x=x,y=y,z=z,
+            metric_kind=kind.metric_kind,metric_value=value,metric_value_verified=not lifetime,metric_max_verified=false,
+            sampled_frame=ctx.frame,network_goid=goid,network_type=kind.type_hash,
+            auxiliary_sample_frame=row.aux_frame,auxiliary=row.aux,
+            source=kind.metric.source,schema_sha256=profile.schema_sha256,
+            identity_basis=basis,identity_inferred=basis=='static_type_and_unique_vector_match',
+            identity_retained=retained_identity,identity_established_frame=established_frame}
+        if heat then
+            result.temperature=value;result.static_heat_threshold=kind.static_heat_threshold
+            result.metric_max=kind.static_heat_threshold
+            result.metric_max_source='static_overheat_threshold'
+            result.metric_max_sampled_frame=ctx.frame
+            result.metric_estimated=true
+            result.metric_estimate_basis='static_overheat_threshold'
+        elseif lifetime then
+            result.metric_max=kind.estimated_lifetime_seconds
+            result.metric_max_source='static_lifetime'
+            result.metric_max_sampled_frame=ctx.frame
+            result.metric_estimated=true
+            result.metric_estimate_basis='first_verified_observation'
+            result.first_verified_observation_time=row.lifetime_started
+        else result.rounds=value end
+        return result
+    end
+    api.forget=forget
+    function api.shutdown()
+        world,context,last_session=nil,nil,nil
+        clear_session()
+        identity_ready=false
+        identity_problem=nil
+        if identity and type(identity.shutdown)=='function' then
+            local ok,err=pcall(identity.shutdown)
+            if not ok then
+                identity_problem='identity_shutdown_failed'
+                call_problem('identity.shutdown',ok,err)
+            end
+        end
+        reason='shutdown'
+    end
+    function api.status()
+        return {reason=reason,call_detail=call_detail,tracked=cache_count,types=#types,sampled=count.sampled,
+            returned=count.returned,type_checks=count.type_checks,
+            schema_checks=count.schema_checks,errors=count.errors,
+            steam_build=profile.steam_build,schema_sha256=profile.schema_sha256,
+            native_mapping_verified=mapping_seen,network_rounds_verified=rounds_seen,
+            network_temperature_verified=temperature_seen,network_metric_verified=rounds_seen or temperature_seen,
+            ammo_returned=count.ammo_returned,heat_returned=count.heat_returned,lifetime_returned=count.lifetime_returned,
+            positional_mapping_used=positional_used,identity_reason=identity_problem,
+            identity_inference_validated=false,
+            synchronizer_state=sync_state,
+            validation_reason=positional_used and 'vector_identity_inference_not_runtime_validated'
+                or ((sync_state=='returned_nil' or sync_state=='call_error' or sync_state=='api_missing')
+                and 'native_synchronizer_unavailable'
+                or (not mapping_seen and 'native_mapping_not_runtime_verified')
+                or (not rounds_seen and not temperature_seen and 'network_metric_not_runtime_verified'
+                    or 'game_metric_behavior_not_validated')),
+            game_validated=false}
+    end
+    return api
+end
+
+
+end)()
+local create_identity = (function()
+-- Read-only inferred Unit/network identity, using static model-to-type bindings.
+-- factory(ot,profile) -> reset(world), update(targets), resolve(unit,model_hash),
+-- shutdown(), status(). update must precede resolve in the same frame.
+-- profile.bindings: {model_hash,type_hash,call,position_field,position_slot,fields}.
+-- fields is the complete ordered ID32 list from this build's network_config.
+-- position_field may be a verified generated ID32 call alias; never guess it.
+-- targets: dense {unit,model_hash} array of ALL tracked sentry candidates.
+--
+-- This is inference, NOT a native pointer mapping. A match needs compatible
+-- static type and a candidate network vector within 1 mm of the Unit root,
+-- unique in BOTH directions. That vector's semantics are unverified. Negative
+-- classifications are rechecked after a ten-second cooldown with a throughput-sized age limit
+-- capped at 120 game seconds. Complete classification is required to ADMIT a
+-- new identity. Established Unit/GOID pairs survive discovery work only while
+-- their original object row, current type/vector, and complete Unit census
+-- remain consistent and unique. No previous ammo value is stored here.
+-- Only Unit handles and numerical/cache data persist; no Vector3 is retained.
+-- No setters, RPCs, memory access, spawning, or nearest-distance fallback.
+-- https://help.autodesk.com/cloudhelp/ENU/Stingray-Help/lua_ref/obj_stingray_GameSession.html
+-- peers(session) -> string[]; objects_owned_by(session,peer) -> integer[].
+return function(ot,profile)
+    local S=ot.engine
+    local App,Unit,V3,Net,GS=S.Application or {},S.Unit or {},S.Vector3 or {},S.Network or {},S.GameSession or {}
+    local MAX_CHECKS,SECONDS,MAX_POSITIVES=256,0.0005,128
+    local RECHECK_INTERVAL,BASE_AGE,MAX_AGE,EPS2=10,12,120,0.001^2
+    local world,session,rows,schemas=nil,nil,{},{}
+    local pending,refresh,ph,rh={},{},1,1
+    local resolved,resolved_frame={},nil
+    local established,retired_units={},{}
+    local discovery_complete,discovery_reason,retained_count,new_count=false,'awaiting_discovery',0,0
+    local validation_time,validation_frame=nil,nil
+    local reason,problem='no_world',nil
+    local budget_frame,checks,spent=nil,0,0
+    local objects,unclassified,expired,bound,reclassified=0,0,0,0,0
+    local candidate_count,nearest_distance,nearest_type,distance_frame=0,nil,nil,nil
+    local nearest_unit_position,nearest_network_vector=nil,nil
+    local types,models,by_type={},{},{}
+    local all_types,active_types,scope_signature={}, {},nil
+    local age_limit,required_age,classification_rate=BASE_AGE,BASE_AGE,nil
+    local rate_started,rate_last_time,rate_checks,sweep_seconds,oldest_negative_age=nil,nil,0,nil,0
+    local throughput_limited=false
+    local target_members={}
+    local positive_verifications,known_positive_count=0,0
+    local function finite(v) return type(v)=='number' and v==v and v>-math.huge and v<math.huge end
+    local function integer(v,lo,hi) return finite(v) and v%1==0 and v>=lo and v<=hi end
+    local function hex(v,width,pad)
+        if type(v)~='string' then return nil end
+        v=v:lower():gsub('^0x','')
+        if not v:match('^%x+$') or #v>width then return nil end
+        if pad then return string.rep('0',width-#v)..v end
+        v=v:gsub('^0+','');return v~='' and v or '0'
+    end
+    local function call(fn,...)
+        if type(fn)~='function' then return false,nil end
+        return pcall(fn,...)
+    end
+    local function fail(why)
+        reason=why;resolved,resolved_frame,bound={},nil,0
+        return false,why
+    end
+    local function clear()
+        rows,schemas,pending,refresh,ph,rh={},{},{},{},1,1
+        resolved,resolved_frame={},nil
+        established,retired_units={},{}
+        discovery_complete,discovery_reason,retained_count,new_count=false,'awaiting_discovery',0,0
+        validation_time,validation_frame=nil,nil
+        objects,unclassified,expired,bound=0,0,0,0
+        candidate_count,nearest_distance,nearest_type,distance_frame=0,nil,nil,nil
+        nearest_unit_position,nearest_network_vector=nil,nil
+        budget_frame,checks,spent=nil,0,0
+        age_limit,required_age,classification_rate=BASE_AGE,BASE_AGE,nil
+        rate_started,rate_last_time,rate_checks,sweep_seconds,oldest_negative_age=nil,nil,0,nil,0
+        throughput_limited=false
+        target_members={}
+        positive_verifications,known_positive_count=0,0
+    end
+    local required={App.worlds,Unit.alive,Unit.world,Unit.debug_name,Unit.world_position,V3.to_elements,
+        Net.game_session,Net.peer_id,Net.object_info,GS.peers,GS.objects_owned_by,
+        GS.game_object_exists,GS.game_object_is_type,GS.game_object_field,ot.frame,ot.clock,ot.time}
+    -- Count explicitly: nil holes in an API list must not shorten validation.
+    for i=1,17 do if type(required[i])~='function' then problem='api_unavailable' end end
+    if type(Net.VECTOR3)~='number' then problem='vector3_metadata_unavailable' end
+    local bindings=type(profile)=='table' and profile.bindings
+    if type(bindings)~='table' or #bindings<1 or #bindings>256 then
+        problem='static_bindings_unavailable'
+    else
+        for _,b in ipairs(bindings) do
+            local mh=type(b)=='table' and hex(b.model_hash,16,false)
+            local th=type(b)=='table' and hex(b.type_hash,8,true)
+            if not mh or not th or type(b.call)~='string' or #b.call<1 or #b.call>128
+                or type(b.position_field)~='string' or #b.position_field<1 or #b.position_field>128
+                or type(b.fields)~='table' or #b.fields<1 or #b.fields>512
+                or not integer(b.position_slot,1,#b.fields) then problem='invalid_static_bindings';break end
+            local fields={}
+            for i=1,#b.fields do fields[i]=hex(b.fields[i],8,true) end
+            local fields_valid=true
+            for i=1,#b.fields do if not fields[i] then fields_valid=false end end
+            local position_hash=hex(b.position_field_hash,8,true)
+            if not fields_valid or not position_hash or fields[b.position_slot]~=position_hash then
+                problem='invalid_static_fields';break
+            end
+            local t=by_type[th]
+            if t then
+                if t.call~=b.call or t.position_field~=b.position_field or t.position_slot~=b.position_slot
+                    or #t.fields~=#fields then problem='conflicting_static_bindings';break end
+                for i=1,#fields do if t.fields[i]~=fields[i] then problem='conflicting_static_bindings' end end
+            else
+                t={type_hash=th,call=b.call,position_field=b.position_field,
+                    position_slot=b.position_slot,fields=fields,models={}}
+                by_type[th]=t;types[#types+1]=t
+            end
+            t.models[mh]=true;models[mh]=true
+        end
+    end
+    all_types=types
+    local function live_world()
+        local ok,list=call(App.worlds)
+        if not ok or type(list)~='table' then return nil end
+        for _,w in pairs(list) do if w==world then return true end end
+        return false
+    end
+    local function owned()
+        local ok,peer=call(Net.peer_id)
+        local good,peers=call(GS.peers,session)
+        if not ok or type(peer)~='string' or peer=='' or not good or type(peers)~='table' then
+            return nil,'peer_list_unavailable'
+        end
+        local owners={[peer]=true}
+        for _,p in pairs(peers) do
+            if type(p)~='string' or p=='' then return nil,'invalid_peer_list' end
+            owners[p]=true
+        end
+        local ids,n,owner_count={},0,0
+        for p in pairs(owners) do
+            owner_count=owner_count+1
+            if owner_count>64 then return nil,'owner_limit' end
+            local readable,list=call(GS.objects_owned_by,session,p)
+            if not readable or type(list)~='table' then return nil,'owned_list_unavailable' end
+            for _,id in pairs(list) do
+                if not integer(id,0,2147483647) then return nil,'invalid_owned_id' end
+                if not ids[id] then n=n+1;ids[id]=true end
+                if n>32768 then return nil,'object_limit' end
+            end
+        end
+        return ids
+    end
+    local function enqueue(row,queue)
+        if row.queued==queue then return end
+        row.queued=queue;row.next_type=row.next_type or 1
+        row.job=(row.job or 0)+1
+        local q=queue=='pending' and pending or refresh
+        q[#q+1]={row=row,job=row.job}
+    end
+    local function reconcile(ids,now)
+        for id in pairs(rows) do if not ids[id] then rows[id]=nil end end
+        for id in pairs(ids) do
+            local row=rows[id]
+            if not row then row={id=id,next_type=1};rows[id]=row;enqueue(row,'pending')
+            end
+        end
+    end
+    local function set_scope(targets)
+        local wanted,keys,next_members,new_target={},{},{},false
+        for _,target in ipairs(targets) do
+            local model=type(target)=='table' and hex(target.model_hash,16,false)
+            local unit=type(target)=='table' and target.unit
+            if model and models[model] and unit then
+                next_members[unit]=model
+                if target_members[unit]~=model then new_target=true end
+            end
+            if model and models[model] and not wanted[model] then
+                wanted[model]=true;keys[#keys+1]=model
+            end
+        end
+        table.sort(keys)
+        local signature=table.concat(keys,',')
+        target_members=next_members
+        if signature==scope_signature and not new_target then return #types>0 end
+        local selected,next_set,added={},{},false
+        for _,t in ipairs(all_types) do
+            for model in pairs(t.models) do
+                if wanted[model] then
+                    selected[#selected+1]=t;next_set[t.type_hash]=true
+                    if not active_types[t.type_hash] then added=true end
+                    break
+                end
+            end
+        end
+        types,active_types,scope_signature=selected,next_set,signature
+        for _,row in pairs(rows) do
+            row.next_type,row.started=1,nil
+            if (row.kind and not next_set[row.kind.type_hash]) or (row.kind==false and (added or new_target)) then
+                row.kind=nil;row.queued=nil;enqueue(row,'pending')
+            end
+        end
+        return #types>0
+    end
+    local function positive_rows()
+        local list={}
+        for _,row in pairs(rows) do
+            if row.kind then
+                list[#list+1]=row
+                if #list>MAX_POSITIVES then return nil,'positive_candidate_limit' end
+            end
+        end
+        known_positive_count=#list
+        return list
+    end
+    local function verify_positive(row,frame)
+        if positive_verifications>=MAX_POSITIVES then return false,'positive_verification_limit' end
+        positive_verifications=positive_verifications+1
+        row.checked_frame=nil;row.verify_attempt_frame=frame
+        local ok,exists=call(GS.game_object_exists,session,row.id)
+        if not ok or type(exists)~='boolean' then return false,'candidate_exists_unavailable' end
+        if exists==false then rows[row.id]=nil;return false,'candidate_object_disappeared' end
+        -- Required current-frame evidence is bounded by candidate count, not
+        -- a sub-millisecond timer. A 1 ms os.clock tick must not discard every
+        -- label midway through five otherwise valid turret verifications.
+        local checked,match=call(GS.game_object_is_type,session,row.id,row.kind.call)
+        if not checked or type(match)~='boolean' then return false,'type_check_unavailable' end
+        if not match then
+            row.kind=nil;row.next_type=1;enqueue(row,'pending')
+            return false,'candidate_type_changed'
+        end
+        row.checked_frame=frame
+        return true
+    end
+    local function check_type(id,t)
+        if checks>=MAX_CHECKS or spent>=SECONDS then return nil,'classification_budget' end
+        local before_ok,before=call(ot.clock)
+        if not before_ok or not finite(before) then return nil,'clock_unavailable' end
+        checks=checks+1
+        local ok,result=call(GS.game_object_is_type,session,id,t.call)
+        local after_ok,after=call(ot.clock)
+        if not after_ok or not finite(after) or after<before then spent=math.huge
+        else spent=spent+after-before end
+        if not ok or type(result)~='boolean' then return nil,'type_check_unavailable' end
+        return result
+    end
+    local function classify(queue,head,name,frame,now)
+        local stop=#queue
+        while head<=stop do
+            local ticket=queue[head]
+            local row=ticket.row
+            if rows[row.id]~=row or row.queued~=name or row.job~=ticket.job then head=head+1
+            else
+                -- FIFO completion times keep the refresh queue in due order.
+                -- Waiting is deliberate idle time, not evidence of low CPU throughput.
+                if name=='refresh' and not row.started and now<(row.refresh_due or 0) then return head end
+                local t=types[row.next_type]
+                local match,why=check_type(row.id,t)
+                if match==nil then return head,why end
+                row.started=row.started or now
+                if match or row.next_type==#types then
+                    row.kind=match and t or false;row.at=row.started;row.next_type,row.started=1,nil
+                    row.queued=nil;head=head+1;reclassified=reclassified+1
+                    if not match then row.refresh_due=now+RECHECK_INTERVAL;enqueue(row,'refresh') end
+                    -- Jobs appended by a refresh completion wait for the next update.
+                else row.next_type=row.next_type+1 end
+            end
+        end
+        return head
+    end
+    local function observe_classification(now,work)
+        local elapsed=rate_last_time and now-rate_last_time or 0
+        rate_last_time=now
+        if elapsed<0 or elapsed>1 then
+            rate_started,rate_checks=0,0
+            return
+        end
+        if work<=0 then return end
+        -- Measure only updates that actually perform classification. The ten
+        -- second refresh cooldown must not be mistaken for a slower scanner.
+        rate_started=(rate_started or 0)+elapsed
+        rate_checks=rate_checks+work
+        if rate_started>=0.25 then
+            local measured=rate_checks/rate_started
+            if not classification_rate or measured<classification_rate then
+                classification_rate=measured
+            else classification_rate=classification_rate*0.8+measured*0.2 end
+            rate_started,rate_checks=0,0
+        end
+    end
+    local function schema(t)
+        local saved=schemas[t.type_hash]
+        if saved~=nil then return saved.valid,saved.reason end
+        local function detail(value) return tostring(value):gsub('[\r\n]',' '):sub(1,64) end
+        local function bad(code)
+            schemas[t.type_hash]={valid=false,reason=code}
+            return false,code
+        end
+        local ok,info=call(Net.object_info,t.call)
+        if not ok or type(info)~='table' or type(info.fields)~='table' then
+            return false,'type_metadata_unavailable'
+        end
+        local count=0
+        for index in pairs(info.fields) do
+            count=count+1
+            if not integer(index,1,#t.fields) then return bad('schema_field_shape_mismatch:index='..detail(index)) end
+        end
+        if count~=#t.fields then return bad('schema_field_count_mismatch:expected='..#t.fields..':actual='..count) end
+        for i=1,#t.fields do
+            local field=info.fields[i]
+            local field_id=type(field)=='table' and field.id or nil
+            if type(field_id)=='userdata' then
+                local readable,text=pcall(tostring,field_id)
+                field_id=readable and text or nil
+            end
+            -- Only an entire bare/0x hexadecimal ID is accepted. Do not extract
+            -- digits from arbitrary userdata addresses or diagnostic strings.
+            if type(field)~='table' or hex(field_id,8,true)~=t.fields[i] then
+                return bad('schema_field_order_mismatch:slot='..i..':expected='..t.fields[i]..':actual='..detail(type(field)=='table' and field.id or field))
+            end
+        end
+        if info.fields[t.position_slot].type~=Net.VECTOR3 then return bad('candidate_field_not_vector3:slot='..t.position_slot..':actual='..detail(info.fields[t.position_slot].type)) end
+        schemas[t.type_hash]={valid=true};return true
+    end
+    local function xyz(value)
+        local ok,x,y,z=call(V3.to_elements,value)
+        if ok and finite(x) and finite(y) and finite(z) then return {x=x,y=y,z=z} end
+    end
+    local function targets_now(targets)
+        local out,seen={},{}
+        for i=1,#targets do
+            local row=targets[i]
+            local mh=type(row)=='table' and hex(row.model_hash,16,false)
+            local unit=type(row)=='table' and row.unit
+            if not unit or not mh then return nil,'invalid_target' end
+            local ok,alive=call(Unit.alive,unit)
+            if not ok then return nil,'target_alive_unavailable' end
+            if alive==true and models[mh] and not seen[unit] then
+                local wok,uw=call(Unit.world,unit)
+                local nok,name=call(Unit.debug_name,unit)
+                local actual=nok and type(name)=='string' and name:match('#ID%[(%x+)%]')
+                if not wok or uw~=world or not actual or hex(actual,16,false)~=mh then return nil,'target_identity_changed' end
+                local pok,p=call(Unit.world_position,unit,1)
+                local pos=pok and xyz(p)
+                if not pos then return nil,'target_position_unavailable' end
+                pos.unit,pos.model_hash=unit,mh;out[#out+1]=pos;seen[unit]=true
+            end
+        end
+        return out
+    end
+    local function complete(now)
+        objects,unclassified,expired,oldest_negative_age=0,0,0,0
+        local nonpositive,backwards=0,false
+        for _,row in pairs(rows) do
+            objects=objects+1
+            if not row.kind then nonpositive=nonpositive+1 end
+            if row.kind==nil then unclassified=unclassified+1
+            elseif row.kind==false then
+                oldest_negative_age=math.max(oldest_negative_age,now-row.at)
+                if now<row.at then backwards=true end
+            end
+        end
+        -- Allow the intentional ten-second cooldown plus time to cover every
+        -- nonpositive ID against every currently relevant type. The full owned
+        -- set must still be classified, and actual negative ages remain bounded.
+        if nonpositive==0 then required_age,sweep_seconds=BASE_AGE,0
+        elseif classification_rate and classification_rate>0 then
+            sweep_seconds=nonpositive*#types/classification_rate
+            required_age=BASE_AGE+1.5*sweep_seconds
+        elseif classification_rate==0 then
+            required_age,sweep_seconds=MAX_AGE+1,nil
+        else required_age,sweep_seconds=BASE_AGE,nil end
+        throughput_limited=required_age>MAX_AGE
+        local desired=math.min(MAX_AGE,required_age)
+        if desired>age_limit then age_limit=desired
+        elseif unclassified==0 and oldest_negative_age<=desired then
+            -- Do not shrink under evidence that was accepted using a longer
+            -- window until the whole retained set is fresh enough for it.
+            age_limit=desired
+        end
+        for _,row in pairs(rows) do
+            if row.kind==false and (now-row.at>age_limit or now<row.at) then expired=expired+1 end
+        end
+        if backwards then return false,'game_time_reversed' end
+        if unclassified>0 then return false,'classifying_new_objects' end
+        if expired>0 then
+            return false,throughput_limited and 'classification_throughput_below_limit' or 'negative_cache_expired'
+        end
+        return true
+    end
+    local function compact()
+        local function tail(q,h)
+            if h<128 then return q,h end
+            local out={};for i=h,#q do out[#out+1]=q[i] end;return out,1
+        end
+        pending,ph=tail(pending,ph);refresh,rh=tail(refresh,rh)
+    end
+    local api={}
+    function api.reset(next_world)
+        world=next_world;session=nil;clear();scope_signature,active_types=nil,{}
+        reason=world and 'awaiting_targets' or 'no_world'
+    end
+    function api.update(targets)
+        resolved,resolved_frame,bound={},nil,0
+        positive_verifications,known_positive_count=0,0
+        retained_count,new_count,discovery_complete=0,0,false
+        if problem then return fail(problem) end
+        if not world then return fail('world_unavailable') end
+        local world_live=live_world()
+        if world_live~=true then
+            if world_live==false then established,retired_units={},{} end
+            return fail('world_unavailable')
+        end
+        if type(targets)~='table' or #targets>256 then
+            return fail('invalid_targets')
+        end
+        local fok,frame=call(ot.frame);local tok,now=call(ot.time)
+        if not fok or not integer(frame,0,9007199254740991) or not tok or not finite(now) then
+            return fail('time_unavailable')
+        end
+        if (validation_time and now<validation_time) or (validation_frame and frame<validation_frame) then
+            established,retired_units={},{};validation_time,validation_frame=now,frame
+            return fail('identity_time_reversed')
+        end
+        if budget_frame~=frame then budget_frame,checks,spent=frame,0,0 end
+        local sok,current=call(Net.game_session)
+        if not sok then return fail('session_read_unavailable') end
+        if current==nil then session=nil;clear();return fail('session_unavailable') end
+        if current~=session then session=current;clear();budget_frame=frame end
+        validation_time,validation_frame=now,frame
+        if #targets==0 then established,retired_units={},{};return fail('no_targets') end
+
+        -- The full current turret census is required even for retained pairs:
+        -- a newly deployed overlapping Unit must block its affected old label.
+        local units,err=targets_now(targets)
+        if not units then return fail(err) end
+        if not set_scope(targets) then return fail('no_static_types_for_targets') end
+        local unit_by={}
+        for _,u in ipairs(units) do unit_by[u.unit]=u end
+        for unit in pairs(established) do if not unit_by[unit] then established[unit]=nil end end
+        for unit in pairs(retired_units) do if not unit_by[unit] then retired_units[unit]=nil end end
+        local ids,why=owned();if not ids then return fail(why) end
+        reconcile(ids,now)
+        local positives,positive_problem=positive_rows()
+        if not positives then return fail(positive_problem) end
+        local candidate_problem
+        for _,row in ipairs(positives) do
+            local verified,verify_problem=verify_positive(row,frame)
+            if not verified then candidate_problem=candidate_problem or verify_problem end
+        end
+        local classification_before=checks
+        ph,why=classify(pending,ph,'pending',frame,now)
+        if not why then rh,why=classify(refresh,rh,'refresh',frame,now) end
+        compact()
+        observe_classification(now,checks-classification_before)
+        local discovery_problem=why and why~='classification_budget' and why or nil
+        local done,wait=complete(now)
+        if wait=='game_time_reversed' then established,retired_units={},{};return fail(wait) end
+        ids,why=owned();if not ids then return fail(why) end
+        reconcile(ids,now)
+        local current_done,current_wait=complete(now)
+        done=done and current_done;wait=current_wait or wait
+        positives,positive_problem=positive_rows()
+        if not positives then return fail(positive_problem) end
+        for _,row in ipairs(positives) do
+            if row.checked_frame~=frame and row.verify_attempt_frame~=frame then
+                local verified,verify_problem=verify_positive(row,frame)
+                if not verified then candidate_problem=candidate_problem or verify_problem end
+            end
+        end
+        -- A successful check must still refer to the same observed object row.
+        -- Never replace an established pair with a new GOID or recycled row.
+        for unit,p in pairs(established) do
+            local row=rows[p.goid]
+            if not row or row~=p.object_row or not row.kind or row.kind.type_hash~=p.type_hash
+                or unit_by[unit].model_hash~=p.model_hash then
+                established[unit]=nil;retired_units[unit]=true
+            end
+        end
+        local candidates,candidate_by={},{}
+        for id,row in pairs(rows) do
+            if row.kind and row.checked_frame==frame then
+                local valid,schema_reason=schema(row.kind)
+                if not valid then candidate_problem=candidate_problem or (schema_reason..':'..row.kind.type_hash)
+                else
+                    local ok,value=call(GS.game_object_field,session,id,row.kind.position_field)
+                    local pos=ok and xyz(value)
+                    if not pos then
+                        candidate_problem=candidate_problem or ('candidate_vector_read_failed:'..row.kind.type_hash)
+                    else
+                        pos.id,pos.kind,pos.object_row=id,row.kind,row
+                        candidates[#candidates+1]=pos;candidate_by[id]=pos
+                    end
+                end
+            elseif row.kind then candidate_problem=candidate_problem or 'candidate_type_not_checked_this_frame' end
+        end
+        discovery_complete=done and not discovery_problem and not candidate_problem
+        discovery_reason=discovery_problem or candidate_problem or wait or 'complete'
+        candidate_count,nearest_distance,nearest_type,distance_frame=#candidates,nil,nil,frame
+        nearest_unit_position,nearest_network_vector=nil,nil
+        local unit_count,id_count,choice={},{},{}
+        for _,u in ipairs(units) do
+            for _,c in ipairs(candidates) do
+                if c.kind.models[u.model_hash] then
+                    local distance2=(u.x-c.x)^2+(u.y-c.y)^2+(u.z-c.z)^2
+                    if not nearest_distance or distance2<nearest_distance^2 then
+                        nearest_distance,nearest_type=math.sqrt(distance2),c.kind.type_hash
+                        nearest_unit_position={x=u.x,y=u.y,z=u.z}
+                        nearest_network_vector={x=c.x,y=c.y,z=c.z}
+                    end
+                    if distance2<=EPS2 then
+                        unit_count[u.unit]=(unit_count[u.unit] or 0)+1
+                        id_count[c.id]=(id_count[c.id] or 0)+1;choice[u.unit]=c
+                    end
+                end
+            end
+        end
+        for _,u in ipairs(units) do
+            local p=established[u.unit]
+            local c=p and candidate_by[p.goid] or choice[u.unit]
+            local same=p and c and c.object_row==p.object_row and c.kind.type_hash==p.type_hash
+            local original=same and choice[u.unit]==c
+            local unique=c and unit_count[u.unit]==1 and id_count[c.id]==1
+            local retained=p and original and unique
+            local admit=not p and not retired_units[u.unit] and discovery_complete and unique
+            if retained or admit then
+                if admit then
+                    p={goid=c.id,type_hash=c.kind.type_hash,model_hash=u.model_hash,
+                        object_row=c.object_row,established_frame=frame,established_time=now}
+                    established[u.unit]=p;new_count=new_count+1
+                else retained_count=retained_count+1 end
+                resolved[u.unit]={goid=p.goid,type_hash=p.type_hash,call=c.kind.call,session=session,
+                    frame=frame,model_hash=u.model_hash,identity_basis='static_type_and_unique_vector_match',
+                    identity_retained=retained==true,identity_established_frame=p.established_frame}
+                bound=bound+1
+            end
+        end
+        resolved_frame=frame
+        if bound>0 then
+            reason=discovery_complete and 'inferred_unique_bindings' or 'retained_verified_bindings'
+            return true
+        end
+        reason=discovery_complete and 'no_unique_vector_match' or discovery_reason
+        return discovery_complete,reason
+    end
+    function api.resolve(unit,model)
+        local ok,frame=call(ot.frame);local row=resolved[unit]
+        if not ok or frame~=resolved_frame or not row or row.frame~=frame or row.model_hash~=hex(model,16,false) then return nil,reason end
+        -- Check session and liveness before passing retained handles to another API.
+        local sok,current=call(Net.game_session)
+        if not sok or current~=session then resolved[unit]=nil;return nil,'identity_expired' end
+        local aok,alive=call(Unit.alive,unit)
+        if not aok or alive~=true then resolved[unit]=nil;return nil,'identity_expired' end
+        local wok,uw=call(Unit.world,unit)
+        if not wok or uw~=world then resolved[unit]=nil;return nil,'identity_expired' end
+        local eok,exists=call(GS.game_object_exists,session,row.goid)
+        if not eok or exists~=true then resolved[unit]=nil;return nil,'identity_expired' end
+        return {goid=row.goid,type_hash=row.type_hash,call=row.call,session=row.session,frame=row.frame,identity_basis=row.identity_basis,
+            identity_retained=row.identity_retained,identity_established_frame=row.identity_established_frame}
+    end
+    function api.shutdown() api.reset(nil);reason='shutdown' end
+    function api.status()
+        return {reason=reason,objects=objects,unclassified=unclassified,expired_negatives=expired,
+            bound=bound,types=#types,type_checks_this_frame=checks,reclassified=reclassified,
+            discovery_complete=discovery_complete,discovery_reason=discovery_reason,
+            retained_bindings=retained_count,new_bindings=new_count,
+            background_type_checks_this_frame=checks,positive_verifications_this_update=positive_verifications,
+            positive_candidates=known_positive_count,positive_candidate_limit=MAX_POSITIVES,
+            negative_recheck_interval=RECHECK_INTERVAL,
+            candidates=candidate_count,minimum_same_model_distance=nearest_distance,
+            nearest_type_hash=nearest_type,distance_sample_frame=distance_frame,
+            nearest_unit_position=nearest_unit_position,nearest_network_vector=nearest_network_vector,
+            negative_cache_max_age=age_limit,negative_cache_hard_limit=MAX_AGE,
+            classification_checks_per_second=classification_rate,estimated_negative_sweep_seconds=sweep_seconds,
+            required_negative_cache_age=required_age,oldest_negative_age=oldest_negative_age,
+            negative_cache_window_capped=throughput_limited,
+            classification_throughput_limited=throughput_limited and expired>0,position_tolerance_metres=0.001,
+            identity_basis='static_type_and_unique_vector_match',position_semantics_verified=false,
+            identity_inferred=true,game_validated=false}
+    end
+    return api
+end
+
+
+end)()
+local create_census = (function()
+-- Complete current sentry candidates from exact resource queries, Lua 5.1.
+-- factory(ot,profile) -> reset(world), sample(), status(), shutdown().
+-- profile.models contains every allowed model hash; profile.model_resources
+-- contains its full authored .unit path, independently hash-checked at build time.
+-- No World.units scan, negative cache, or persistent Unit classification is used.
+-- The current frame uses at most one query per configured resource. All returned
+-- live Units must match world/model before any candidate list is published.
+return function(ot,profile)
+    ot=type(ot)=='table' and ot or {}
+    profile=type(profile)=='table' and profile or {}
+    local S=type(ot.engine)=='table' and ot.engine or {}
+    local App,World,Unit=S.Application or {},S.World or {},S.Unit or {}
+    local MAX_TARGETS,MAX_RAW_UNITS,MAX_RESOURCES=128,128,10
+    local resources,problem={},nil
+    local world,frame,cached=nil,nil,nil
+    local reason='no_world'
+    local queries,units_checked,target_count,elapsed_ms=0,0,0,0
+    local complete=false
+    local function finite(x)
+        return type(x)=='number' and x==x and x>-math.huge and x<math.huge
+    end
+    local function integer(x,low,high)
+        return finite(x) and x%1==0 and x>=low and x<=high
+    end
+    local function model_hash(value)
+        if type(value)~='string' then return nil end
+        value=value:lower():gsub('^0x','')
+        if #value>16 or not value:match('^%x+$') then return nil end
+        value=value:gsub('^0+','')
+        return value~='' and value or '0'
+    end
+    local function call(fn,...)
+        if type(fn)~='function' then return false,nil end
+        return pcall(fn,...)
+    end
+    local required={App.worlds,World.units_by_resource,Unit.alive,Unit.world,
+        Unit.debug_name,ot.frame,ot.clock}
+    for i=1,7 do
+        if type(required[i])~='function' then problem='resource_query_api_unavailable' end
+    end
+    local models,paths=profile.models,profile.model_resources
+    if type(models)~='table' or type(paths)~='table' then
+        problem='resource_profile_unavailable'
+    else
+        local hashes,names={},{}
+        for hash in pairs(models) do
+            local normalized=model_hash(hash)
+            local path=paths[hash]
+            if not normalized or hashes[normalized] or type(path)~='string'
+                or #path<1 or #path>512 or path:find('%c') or names[path] then
+                problem='invalid_resource_profile'
+                break
+            end
+            hashes[normalized],names[path]=true,true
+            resources[#resources+1]={model_hash=normalized,path=path}
+            if #resources>MAX_RESOURCES then problem='resource_profile_limit';break end
+        end
+        if #resources<1 then problem='resource_profile_empty' end
+        table.sort(resources,function(a,b) return a.model_hash<b.model_hash end)
+    end
+    local function fail(why)
+        cached=nil;complete=false;target_count=0;reason=why
+        return nil,why
+    end
+    local function clear()
+        frame,cached=nil,nil
+        queries,units_checked,target_count,elapsed_ms=0,0,0,0
+        complete=false
+    end
+    local function live_world()
+        local ok,list=call(App.worlds)
+        if not ok or type(list)~='table' then return false end
+        for _,candidate in pairs(list) do if candidate==world then return true end end
+        return false
+    end
+    local function validate(unit,expected)
+        if type(unit)~='userdata' then return nil,'invalid_unit_handle' end
+        local ok,alive=call(Unit.alive,unit)
+        if not ok or type(alive)~='boolean' then return nil,'unit_liveness_unavailable' end
+        if not alive then return false end
+        local wok,uw=call(Unit.world,unit)
+        if not wok or uw~=world then return nil,'unit_world_mismatch' end
+        local nok,name=call(Unit.debug_name,unit)
+        local actual=nok and type(name)=='string' and name:match('#ID%[(%x+)%]')
+        if not actual or model_hash(actual)~=expected then return nil,'unit_model_mismatch' end
+        return true
+    end
+    local function copy_targets(list)
+        local out={}
+        for i=1,#list do
+            local row=list[i]
+            out[i]={unit=row.unit,model_hash=row.model_hash}
+        end
+        return out
+    end
+    local api={}
+    function api.reset(next_world)
+        world=next_world;clear()
+        reason=world and 'awaiting_sample' or 'no_world'
+    end
+    function api.sample()
+        if not world then return fail('no_world') end
+        if problem then return fail(problem) end
+        local fok,current=call(ot.frame)
+        if not fok or not integer(current,0,9007199254740991) then return fail('frame_unavailable') end
+        if not live_world() then return fail('world_unavailable') end
+        if frame==current then
+            if not cached then return nil,reason end
+            -- Re-check returned handles if another caller asks in this frame.
+            -- The complete query set is never reissued or replaced with a subset.
+            for i=1,#cached do
+                local row=cached[i]
+                local valid,why=validate(row.unit,row.model_hash)
+                if valid~=true then return fail(why or 'cached_unit_destroyed') end
+            end
+            return copy_targets(cached),'complete'
+        end
+        frame=current;cached=nil;complete=false
+        queries,units_checked,target_count,elapsed_ms=0,0,0,0
+        local tok,started=call(ot.clock)
+        if not tok or not finite(started) then return fail('clock_unavailable') end
+        local function measure()
+            local ok,tick=call(ot.clock)
+            if not ok or not finite(tick) or tick<started then return false,'clock_unavailable' end
+            elapsed_ms=(tick-started)*1000
+            return true
+        end
+        local targets,seen={},{}
+        local raw_total=0
+        for _,resource in ipairs(resources) do
+            queries=queries+1
+            local ok,list=call(World.units_by_resource,world,resource.path)
+            if not ok or type(list)~='table' then return fail('resource_query_unavailable') end
+            local allowed,why=measure()
+            if not allowed then return fail(why) end
+            local count,largest=0,0
+            for index,unit in pairs(list) do
+                count=count+1;raw_total=raw_total+1
+                if raw_total>MAX_RAW_UNITS then return fail('resource_result_limit') end
+                if not integer(index,1,MAX_RAW_UNITS) or type(unit)~='userdata' then
+                    return fail('resource_result_not_dense')
+                end
+                if index>largest then largest=index end
+            end
+            if largest~=count then return fail('resource_result_not_dense') end
+            for i=1,count do
+                local unit=list[i]
+                if seen[unit] then return fail('duplicate_resource_unit') end
+                seen[unit]=true;units_checked=units_checked+1
+                local valid,why=validate(unit,resource.model_hash)
+                if valid==nil then return fail(why) end
+                if valid then
+                    targets[#targets+1]={unit=unit,model_hash=resource.model_hash}
+                    if #targets>MAX_TARGETS then return fail('sentry_candidate_limit') end
+                end
+                if i%32==0 then
+                    local allowed,why=measure();if not allowed then return fail(why) end
+                end
+            end
+        end
+        local allowed,why=measure()
+        if not allowed then return fail(why) end
+        cached=targets;complete=true;target_count=#targets;reason='complete'
+        return copy_targets(cached),reason
+    end
+    function api.shutdown()
+        world=nil;clear();reason='shutdown'
+    end
+    function api.status()
+        return {reason=reason,queries=queries,units_checked=units_checked,targets=target_count,
+            elapsed_ms=elapsed_ms,complete=complete,frame=frame,resources=#resources,
+            basis='current_resource_queries',game_validated=false}
+    end
+    return api
+end
+
+end)()
+local create_camera_units = (function()
+-- Current-frame camera candidates without scanning every Unit in the world.
+-- The resource hash is observed in Objective Tracker's actual camera logs.
+-- IdString64.from_hex is used by installed-hud-plus.lua:780-792; its result
+-- is temporary, so construct and consume it inside every sample call.
+-- https://help.autodesk.com/cloudhelp/ENU/Stingray-Help/lua_ref/obj_stingray_IdString64.html
+-- https://help.autodesk.com/cloudhelp/ENU/Stingray-Help/lua_ref/obj_stingray_World.html
+return function(ot)
+    local S=ot.engine
+    local App,World,Unit,Id=S.Application or {},S.World or {},S.Unit or {},S.IdString64 or {}
+    local MODEL,MAX_UNITS='465f4895f3dc98d1',64
+    local reason,total,candidates,frame='not_sampled',0,0,nil
+    local function call(fn,...)
+        if type(fn)~='function' then return false,nil end
+        return pcall(fn,...)
+    end
+    local function reject(value) reason=value;return nil,value end
+    local function current_frame()
+        local ok,value=call(ot.frame)
+        if ok and type(value)=='number' and value>=0 and value<math.huge and value%1==0 then
+            return value
+        end
+    end
+    local function sample(world)
+        reason,total,candidates,frame='sampling',0,0,current_frame()
+        if frame==nil then return reject('camera_frame_unavailable') end
+        if world==nil then return reject('camera_world_unavailable') end
+        local listed,worlds=call(App.worlds)
+        if not listed or type(worlds)~='table' then return reject('camera_world_list_unavailable') end
+        local live_world=false
+        for _,value in pairs(worlds) do if value==world then live_world=true end end
+        if not live_world then return reject('camera_world_not_live') end
+        if type(Id.from_hex)~='function' then return reject('camera_id64_from_hex_unavailable') end
+        local made,key=call(Id.from_hex,MODEL)
+        if not made or type(key)~='userdata' then return reject('camera_resource_key_unavailable') end
+        -- Do not turn MODEL into an ordinary hex-string resource name: that
+        -- would hash the hexadecimal text instead of using the observed ID64.
+        local queried,units=call(World.units_by_resource,world,key)
+        key=nil
+        if not queried or type(units)~='table' then return reject('camera_resource_query_failed') end
+        local highest=0
+        for index,unit in pairs(units) do
+            total=total+1
+            if total>MAX_UNITS then return reject('camera_resource_limit') end
+            if type(index)~='number' or index%1~=0 or index<1 or index>MAX_UNITS
+                or type(unit)~='userdata' then return reject('camera_resource_list_invalid') end
+            if index>highest then highest=index end
+        end
+        if highest~=total then return reject('camera_resource_list_incomplete') end
+        local result,seen={},{}
+        for i=1,total do
+            local unit=units[i]
+            if not seen[unit] then
+                seen[unit]=true
+                local alive_ok,alive=call(Unit.alive,unit)
+                if not alive_ok or (alive~=true and alive~=false) then
+                    return reject('camera_unit_liveness_unavailable')
+                end
+                if alive then
+                    local world_ok,unit_world=call(Unit.world,unit)
+                    if not world_ok or unit_world~=world then return reject('camera_unit_world_mismatch') end
+                    local named,name=call(Unit.debug_name,unit)
+                    local hash=named and type(name)=='string' and name:match('^#ID%[(%x+)%]$') or nil
+                    if not hash or hash:lower():gsub('^0+','')~=MODEL then
+                        return reject('camera_unit_model_mismatch')
+                    end
+                    result[#result+1]=unit
+                end
+            end
+        end
+        if current_frame()~=frame then return reject('camera_frame_changed_during_query') end
+        candidates=#result
+        -- Normal complete game back-buffer rendering remains an integration
+        -- assumption; the selector still checks mono/perspective and its pose.
+        result.full_back_buffer_verified=true
+        result.frame=frame
+        reason=candidates>0 and 'complete' or 'no_camera_candidates'
+        return result
+    end
+    return {
+        sample=sample,
+        status=function()
+            return {reason=reason,total=total,candidates=candidates,frame=frame,
+                resource_hash=MODEL,source='World.units_by_resource',
+                resource_key_source='IdString64.from_hex',
+                viewport_source='full_back_buffer_assumption',game_validated=false}
+        end,
+    }
+end
+end)()
+local create_camera = (function()
+-- Camera adapter for sentry_labels.lua.
+-- Source only: no active-camera discovery is claimed by this module.
+-- A gameplay integration must identify the active camera and its viewport in
+-- the current frame. A moving unit or a model hash does not establish that.
+-- Stingray: camera forward is matrix Y, right is X, and up is Z.
+-- Never retain the returned pose across frames (temporary engine userdata).
+return function(ot)
+    local S=ot.engine
+    local App,Unit,Camera,M=S.Application,S.Unit,S.Camera,S.Matrix4x4
+    local reason='waiting_for_active_camera'
+    local function finite(value)
+        return type(value)=='number' and value==value
+            and value~=math.huge and value~=-math.huge
+    end
+    local function reject(value)
+        reason=value
+        return nil,value
+    end
+    local function call(fn,...)
+        if type(fn)~='function' then return false,nil end
+        return pcall(fn,...)
+    end
+    local function live_world(world)
+        if not world then return false end
+        local ok,worlds=call(App and App.worlds)
+        if not ok or type(worlds)~='table' then return false end
+        for _,candidate in pairs(worlds) do
+            if candidate==world then return true end
+        end
+        return false
+    end
+    local function orthonormal(elements)
+        local function dot(a,b)
+            return elements[a]*elements[b]+elements[a+1]*elements[b+1]
+                +elements[a+2]*elements[b+2]
+        end
+        for _,axis in ipairs({1,4,7}) do
+            if math.abs(dot(axis,axis)-1)>0.001 then return false end
+        end
+        return math.abs(dot(1,4))<0.001 and math.abs(dot(1,7))<0.001
+            and math.abs(dot(4,7))<0.001
+    end
+    local function sample(world,active)
+        if type(active)~='table' or active.verified~=true then
+            return reject('waiting_for_active_camera')
+        end
+        local okFrame,frame=call(ot.frame)
+        if not okFrame or not finite(frame) or active.frame~=frame then
+            return reject('stale_camera_selection')
+        end
+        if active.world~=world or not live_world(world) then
+            return reject('world_unavailable')
+        end
+        local unit,index=active.unit,active.camera_index
+        if not unit or not finite(index) or index<1 or index%1~=0 then
+            return reject('invalid_camera_selection')
+        end
+        local width,height=active.viewport_width,active.viewport_height
+        if not finite(width) or not finite(height) or width<16 or height<16
+            or width>32768 or height>32768 then
+            return reject('viewport_unavailable')
+        end
+        local okAlive,alive=call(Unit and Unit.alive,unit)
+        if not okAlive or alive~=true then return reject('camera_unit_destroyed') end
+        local okWorld,ownerWorld=call(Unit and Unit.world,unit)
+        if not okWorld or ownerWorld~=world then return reject('camera_world_mismatch') end
+        local okCount,count=call(Unit and Unit.num_cameras,unit)
+        if not okCount or not finite(count) or index>count then
+            return reject('camera_index_unavailable')
+        end
+        local okCamera,camera=call(Unit and Unit.camera,unit,index)
+        if not okCamera or camera==nil then return reject('camera_unavailable') end
+        local okProjection,projection=call(Camera and Camera.projection_type,camera)
+        if not okProjection or not Camera or Camera.PERSPECTIVE==nil
+            or projection~=Camera.PERSPECTIVE then
+            return reject('unsupported_projection')
+        end
+        local okMode,mode=call(Camera.mode,camera)
+        if not okMode or Camera.MONO==nil or mode~=Camera.MONO then
+            return reject('unsupported_camera_mode')
+        end
+        local okFov,fov=call(Camera.vertical_fov,camera)
+        if not okFov or not finite(fov) or fov<=0.01 or fov>=math.pi-0.01 then
+            return reject('invalid_vertical_fov')
+        end
+        local okPose,pose=call(Camera.world_pose,camera)
+        if not okPose or pose==nil or not M or type(M.to_elements)~='function' then
+            return reject('camera_pose_unavailable')
+        end
+        local packed={pcall(M.to_elements,pose)}
+        if packed[1]~=true or #packed~=13 then return reject('invalid_camera_pose') end
+        local elements={}
+        for i=1,12 do
+            local value=packed[i+1]
+            if not finite(value) then return reject('invalid_camera_pose') end
+            elements[i]=value
+        end
+        if not orthonormal(elements) then return reject('scaled_camera_pose') end
+        local okNear,near=call(Camera.near_range,camera)
+        if not okNear or not finite(near) or near<=0 then
+            return reject('near_plane_unavailable')
+        end
+        reason='ready'
+        return {
+            verified=true,world=world,frame=frame,pose=pose,
+            x=elements[10],y=elements[11],z=elements[12],
+            forward_x=elements[4],forward_y=elements[5],forward_z=elements[6],
+            vertical_fov_radians=fov,viewport_width=width,viewport_height=height,
+            near_range=near,projection='perspective',
+        }
+    end
+    return {
+        sample=sample,
+        status=function() return {reason=reason} end,
+    }
+end
+
+end)()
+local create_camera_select = (function()
+-- Read-only camera matcher, called from the render callback.
+-- factory(ot) -> select(world, camera_units), reset(), status().
+-- camera_units is a dense array of the world's known camera-bearing Units.
+-- Optional metadata: viewport, window; without a viewport the caller asserts
+-- full_back_buffer_verified=true. Window-sized rendering is an explicit
+-- integration assumption, not something Gui.resolution() alone proves.
+--
+-- Match World.debug_camera_pose to a unique current candidate first. If none
+-- matches, compare ONLY frame-1's numerical candidate snapshots, then select
+-- that same Unit/index's CURRENT camera. Never retain temporary Matrix4x4,
+-- Vector3, or Camera userdata in history, or reuse an old selected identity.
+-- Switching cameras can still select the previous camera for one render frame.
+-- Missing history, gaps, world changes, unreadable candidates or ambiguity hide
+-- labels. The new one-frame timing path still needs an in-game rerun.
+--
+-- https://help.autodesk.com/cloudhelp/ENU/Stingray-Help/lua_ref/obj_stingray_Gui.html
+-- Gui.resolution(viewport?, window?) returns viewport GUI pixel dimensions;
+-- without viewport, it returns the back-buffer resolution.
+-- https://help.autodesk.com/cloudhelp/2019/ENU/Max-Interactive-Help/lua_ref/obj_stingray_World.html
+-- World.debug_camera_pose(world) returns the last render camera's pose.
+return function(ot)
+    local S=ot.engine
+    local App,World,Unit,Camera,Gui,M=S.Application,S.World,S.Unit,S.Camera,S.Gui,S.Matrix4x4
+    local reason,matches,checked='not_sampled',0,0
+    local viewport_source,selection_basis,latency='unresolved','none',nil
+    local current_snapshot,previous_snapshot=nil,nil
+    local MAX_UNITS,MAX_CAMERAS=64,8
+    local AXIS_EPS,POSITION_EPS=0.00001,0.001
+    local function finite(value)
+        return type(value)=='number' and value==value
+            and value~=math.huge and value~=-math.huge
+    end
+    local function call(fn,...)
+        if type(fn)~='function' then return false,nil end
+        return pcall(fn,...)
+    end
+    local function reject(value) reason=value;return nil,value end
+    local function matrix(pose)
+        if pose==nil then return nil end
+        local result={call(M and M.to_elements,pose)}
+        if result[1]~=true or #result~=13 then return nil end
+        local values={}
+        for i=1,12 do
+            if not finite(result[i+1]) then return nil end
+            values[i]=result[i+1]
+        end
+        return values
+    end
+    local function same_pose(a,b)
+        for i=1,12 do
+            if math.abs(a[i]-b[i])>(i<=9 and AXIS_EPS or POSITION_EPS) then return false end
+        end
+        return true
+    end
+    local function live_world(world)
+        if world==nil then return false end
+        local ok,worlds=call(App and App.worlds)
+        if not ok or type(worlds)~='table' then return false end
+        for _,candidate in pairs(worlds) do if candidate==world then return true end end
+        return false
+    end
+    local function prior_frame(world,frame)
+        for _,snapshot in pairs({current_snapshot,previous_snapshot}) do
+            if snapshot.world==world and snapshot.frame==frame-1 then return snapshot end
+        end
+    end
+    local function remember(world,frame,entries,prior)
+        -- Same-frame repeated renders replace only this frame's snapshot.
+        previous_snapshot=prior
+        current_snapshot={world=world,frame=frame,entries=entries}
+    end
+    local function select_camera(world,units)
+        matches,checked=0,0
+        viewport_source,selection_basis,latency='unresolved','none',nil
+        if type(units)~='table' then return reject('camera_candidates_unavailable') end
+        if #units>MAX_UNITS then return reject('too_many_camera_candidates') end
+        if not live_world(world) then return reject('world_unavailable') end
+        local frame_ok,frame=call(ot.frame)
+        if not frame_ok or not finite(frame) or frame<0 or frame%1~=0 then
+            return reject('frame_unavailable')
+        end
+        if units.viewport==nil and units.full_back_buffer_verified~=true then
+            return reject('viewport_unverified')
+        end
+        viewport_source=units.viewport~=nil and 'explicit_viewport' or 'full_back_buffer_assumption'
+        local size_ok,width,height
+        if units.viewport==nil and units.window==nil then
+            size_ok,width,height=call(Gui and Gui.resolution)
+        else
+            size_ok,width,height=call(Gui and Gui.resolution,units.viewport,units.window)
+        end
+        if not size_ok or not finite(width) or not finite(height)
+            or width<16 or height<16 or width>32768 or height>32768 then
+            return reject('viewport_unavailable')
+        end
+        local debug_ok,debug_pose=call(World and World.debug_camera_pose,world)
+        local last=debug_ok and matrix(debug_pose) or nil
+        if not last then return reject('last_render_pose_unavailable') end
+        local selected,seen,entries,live_candidates=nil,{},{},{}
+        for i=1,#units do
+            local unit=units[i]
+            if unit==nil then return reject('incomplete_camera_candidates') end
+            if not seen[unit] then
+                seen[unit]=true
+                local alive_ok,alive=call(Unit and Unit.alive,unit)
+                if not alive_ok then return reject('candidate_alive_unreadable') end
+                if alive==true then
+                    local world_ok,unit_world=call(Unit and Unit.world,unit)
+                    if not world_ok then return reject('candidate_world_unreadable') end
+                    if unit_world==world then
+                        local count_ok,count=call(Unit and Unit.num_cameras,unit)
+                        if not count_ok or not finite(count) or count<0 or count%1~=0
+                            or count>MAX_CAMERAS then
+                            return reject('candidate_camera_count_unavailable')
+                        end
+                        live_candidates[unit]={}
+                        for index=1,count do
+                            local camera_ok,camera=call(Unit.camera,unit,index)
+                            if not camera_ok or camera==nil then return reject('candidate_camera_unavailable') end
+                            local pose_ok,pose=call(Camera and Camera.world_pose,camera)
+                            local values=pose_ok and matrix(pose) or nil
+                            if not values then return reject('candidate_pose_unreadable') end
+                            checked=checked+1
+                            local candidate={unit=unit,camera_index=index,camera=camera}
+                            live_candidates[unit][index]=candidate
+                            entries[#entries+1]={unit=unit,index=index,values=values}
+                            if same_pose(last,values) then matches=matches+1;selected=candidate end
+                        end
+                    end
+                end
+            end
+        end
+        local prior=prior_frame(world,frame)
+        remember(world,frame,entries,prior)
+        if matches>1 then return reject('ambiguous_render_camera') end
+        if matches==1 then
+            selection_basis,latency='unique_current_pose_match_to_last_render',0
+        elseif prior then
+            for _,entry in ipairs(prior.entries) do
+                if same_pose(last,entry.values) then
+                    matches=matches+1
+                    local candidates=live_candidates[entry.unit]
+                    selected=candidates and candidates[entry.index]
+                end
+            end
+            if matches>1 then return reject('ambiguous_previous_frame_render_camera') end
+            if matches==1 and selected==nil then return reject('previous_frame_camera_unavailable') end
+            if matches==1 then selection_basis,latency='previous_frame_render_match',1 end
+        end
+        if selected==nil then return reject('no_current_or_previous_frame_pose_match') end
+        local mode_ok,mode=call(Camera and Camera.mode,selected.camera)
+        local projection_ok,projection=call(Camera and Camera.projection_type,selected.camera)
+        if not mode_ok or not Camera or Camera.MONO==nil or mode~=Camera.MONO then
+            return reject('unsupported_camera_mode')
+        end
+        if not projection_ok or Camera.PERSPECTIVE==nil or projection~=Camera.PERSPECTIVE then
+            return reject('unsupported_projection')
+        end
+        local fov_ok,fov=call(Camera.vertical_fov,selected.camera)
+        if not fov_ok or not finite(fov) or fov<=0.01 or fov>=math.pi-0.01 then
+            return reject('invalid_camera_fov')
+        end
+        reason=latency==0 and 'unique_current_pose_match' or 'unique_previous_frame_pose_match'
+        return {
+            verified=true,frame=frame,world=world,
+            unit=selected.unit,camera_index=selected.camera_index,
+            viewport_width=width,viewport_height=height,viewport_source=viewport_source,
+            selection_basis=selection_basis,selection_latency_frames=latency,
+        }
+    end
+    return {
+        select=select_camera,
+        reset=function()
+            reason='not_sampled';matches,checked=0,0
+            viewport_source,selection_basis,latency='unresolved','none',nil
+            current_snapshot,previous_snapshot=nil,nil
+        end,
+        status=function()
+            return {reason=reason,matches=matches,checked=checked,
+                viewport_source=viewport_source,selection_basis=selection_basis,
+                selection_latency_frames=latency,game_validated=false}
+        end,
+    }
+end
+
+end)()
+local create_labels = (function()
+-- Depth-tested labels: prominent nearby, with a readable screen-size floor at range.
+-- Ammo snapshots keep their real sampling time and expire after at most 80 ms.
+-- All native vectors/matrices/colors stay inside the current render callback.
+-- Ammo digits are real samples; ratios retain their existing calculation basis.
+-- Laser percentages use a static heat threshold; Tesla time is estimated upstream.
+local function finite(v) return type(v)=='number' and v==v and v>-math.huge and v<math.huge end
+local function integer(v,lo,hi) return finite(v) and v%1==0 and v>=lo and v<=hi end
+local function option(v,default,lo,hi)
+    if not finite(v) then return default end
+    return math.max(lo,math.min(hi,v))
+end
+local function callable(v)
+    if type(v)=='function' then return true end
+    local mt=type(v)=='table' and getmetatable(v)
+    return type(mt)=='table' and type(mt.__call)=='function'
+end
+
+local function valid_uv(uv)
+    if type(uv)~='table' then return false end
+    for _,k in ipairs({'u0','v0','u1','v1'}) do
+        if not finite(uv[k]) or uv[k]<0 or uv[k]>1 then return false end
+    end
+    return uv.u1>uv.u0 and uv.v1>uv.v0
+end
+
+return function(ot,config)
+    config=type(config)=='table' and config or {}
+    local S=ot.engine
+    local World,Gui,App,Unit=S.World or {},S.Gui or {},S.Application or {},S.Unit or {}
+    local M,V2,V3,Color=S.Matrix4x4 or {},S.Vector2,S.Vector3,S.Color
+    local height=option(config.pixel_height,24,10,48)
+    local icon_size=option(config.icon_size,36,12,64)
+    local bar_width=option(config.bar_width,64,30,100)
+    local bar_height=option(config.bar_height,3,1,6)
+    local icon_gap=8
+    local segment_gap=3
+    local near_scale=option(config.near_scale,4.5,1,8)
+    local near_distance=option(config.near_distance,8,1,30)
+    local reference_height=option(config.reference_viewport_height,1600,720,4320)
+    local minimum_height=option(config.min_pixel_height,22,8,40)
+    local frame_scale=option(config.frame_scale,1.4,1.1,2)
+    local frame_size=icon_size*frame_scale
+    local frame_alpha=option(config.frame_alpha,90,0,255)
+    local head_offset=option(config.head_offset,2.5,0,10)
+    local max_distance=option(config.max_distance,120,1,300)
+    local max_labels=math.floor(option(config.max_labels,32,1,64))
+    local text_alpha=option(config.text_alpha,185,0,255)
+    local icon_alpha=option(config.icon_alpha,145,0,255)
+    local bar_alpha=option(config.bar_alpha,145,0,255)
+    local font=config.font
+    local font_material=config.font_material
+    local icon_material,icon_texture=config.icon_material,config.icon_texture
+    local bar_uv,frame_uv=config.bar_uv,config.frame_uv
+    local icons=type(config.icons)=='table' and config.icons or {}
+    local world,gui,disabled=nil,nil,false
+    local reason,drawn,eligible,primitives,icons_drawn='no_world',0,0,0,0
+    local missing,logged={},{}
+    local extents,extent_count,font_ratio={},0,nil
+    local peaks={}
+    local assets_ready=false
+    local function require_fn(name,fn) if type(fn)~='function' then missing[#missing+1]=name end end
+    for _,row in ipairs({
+        {'World.create_world_gui',World.create_world_gui},{'World.destroy_gui',World.destroy_gui},
+        {'Application.worlds',App.worlds},{'Application.can_get',App.can_get},
+        {'Gui.text_3d',Gui.text_3d},{'Gui.text_extents',Gui.text_extents},
+        {'Gui.bitmap_3d_uv',Gui.bitmap_3d_uv},{'Gui.reset',Gui.reset},
+        {'Unit.alive',Unit.alive},{'Unit.world',Unit.world},{'ot.frame',ot.frame},{'ot.time',ot.time},
+        {'Matrix4x4.identity',M.identity},{'Matrix4x4.rotation',M.rotation},
+        {'Matrix4x4.to_elements',M.to_elements},{'Matrix4x4.set_rotation',M.set_rotation},
+        {'Matrix4x4.set_translation',M.set_translation},{'Matrix4x4.set_scale',M.set_scale},
+        {'Vector2.to_elements',V2 and V2.to_elements}
+    }) do require_fn(row[1],row[2]) end
+    if not callable(V2) then missing[#missing+1]='Vector2 constructor' end
+    if not callable(V3) then missing[#missing+1]='Vector3 constructor' end
+    if not callable(Color) then missing[#missing+1]='Color constructor' end
+    for _,name in ipairs({'font','font_material','icon_material','icon_texture'}) do
+        if type(config[name])~='string' or #config[name]==0 then missing[#missing+1]=name..' resource' end
+    end
+    if not valid_uv(bar_uv) then missing[#missing+1]='bar_uv white atlas region' end
+    if not valid_uv(frame_uv) then missing[#missing+1]='frame_uv open corner region' end
+    local function log_once(key,message)
+        if logged[key] then return end
+        logged[key]=true
+        if type(ot.log)=='function' then pcall(ot.log,'SENTRY-LABELS %s',message) end
+    end
+    local function call(key,fn,...)
+        if type(ot.risky)=='function' then return ot.risky('labels:'..key,fn,...) end
+        return pcall(fn,...)
+    end
+    local function live_world()
+        if not world then return false end
+        local ok,list=pcall(App.worlds)
+        if not ok or type(list)~='table' then return false end
+        for _,w in pairs(list) do if w==world then return true end end
+        return false
+    end
+    local function dispose()
+        local old=gui;gui=nil
+        if old and live_world() then
+            local ok,err=call('destroy_gui',World.destroy_gui,world,old)
+            if not ok then log_once('destroy',tostring(err)) end
+        end
+    end
+    local function stop(err)
+        disabled=true;reason='backend_error';drawn,primitives,icons_drawn=0,0,0
+        if gui and live_world() then pcall(Gui.reset,gui) end
+        log_once('backend_error','disabled for this world: '..tostring(err))
+    end
+    local function check_assets()
+        if assets_ready then return true end
+        for _,r in ipairs({{'font',font},{'material',font_material},
+                           {'material',icon_material},{'texture',icon_texture}}) do
+            local ok,ready=pcall(App.can_get,r[1],r[2])
+            if not ok or ready~=true then
+                reason='awaiting_asset:'..r[2]
+                log_once(reason,reason)
+                return false
+            end
+        end
+        assets_ready=true
+        return true
+    end
+    local function camera_valid(c,frame)
+        if type(c)~='table' or c.verified~=true or c.world~=world or c.frame~=frame
+            or c.projection~='perspective' or type(c.pose)~='userdata' then return false end
+        for _,k in ipairs({'x','y','z','forward_x','forward_y','forward_z',
+                          'vertical_fov_radians','viewport_width','viewport_height','near_range'}) do
+            if not finite(c[k]) then return false end
+        end
+        local norm=c.forward_x^2+c.forward_y^2+c.forward_z^2
+        return math.abs(norm-1)<.01 and c.vertical_fov_radians>.01 and c.vertical_fov_radians<math.pi-.01
+            and c.viewport_width>=1 and c.viewport_height>=1 and c.near_range>0
+    end
+    local function fresh(r,frame,now)
+        return type(r)=='table' and r.verified==true and r.short_snapshot==true
+            and r.world==world and type(r.unit)=='userdata'
+            and r.validation_frame==frame and r.position_frame==frame
+            and integer(r.sampled_frame,0,frame) and finite(r.sample_time) and finite(r.expires_at)
+            and now>=r.sample_time and now<r.expires_at and r.expires_at-r.sample_time<=.080001
+            and ((r.source=='network.rounds_remaining' and integer(r.rounds,0,999999)
+                    and (r.metric_kind==nil or r.metric_kind=='ammo'))
+                or (r.metric_kind=='heat' and r.source=='network.temperature'
+                    and r.metric_value_verified==true and finite(r.metric_value) and r.metric_value>=0
+                    and finite(r.metric_max) and r.metric_max>0 and r.metric_estimated==true)
+                or (r.metric_kind=='lifetime' and r.source=='estimated.deployment_remaining'
+                    and r.metric_value_verified==false and r.metric_estimated==true
+                    and finite(r.metric_value) and r.metric_value>=0
+                    and finite(r.metric_max) and r.metric_max>0 and r.metric_value<=r.metric_max))
+    end
+    local function valid_icon(r)
+        local uv=icons[r.network_type]
+        return valid_uv(uv) and uv or nil
+    end
+    local function display_value(r,now)
+        local kind=r.metric_kind or 'ammo'
+        if kind=='heat' then
+            local fraction=math.max(0,math.min(1,r.metric_value/r.metric_max))
+            return string.format('%d%%',math.floor(fraction*100+.5)),fraction,kind
+        elseif kind=='lifetime' then
+            local seconds=math.ceil(r.metric_value)
+            return string.format('%d:%02d',math.floor(seconds/60),seconds%60),
+                math.max(0,math.min(1,r.metric_value/r.metric_max)),kind
+        end
+        local peak=peaks[r.unit]
+        if not peak or peak.id~=r.network_goid or peak.session~=r.session or peak.kind~=r.network_type then
+            peak={id=r.network_goid,session=r.session,kind=r.network_type,max=r.rounds}
+            peaks[r.unit]=peak
+        end
+        peak.max=math.max(peak.max,r.rounds);peak.seen=now
+        return string.format('%d',r.rounds),peak.max>0 and r.rounds/peak.max or 0,'ammo'
+    end
+    local function stage_rgb(kind,fraction)
+        if kind=='heat' then
+            -- A filling heat gauge becomes more urgent as overheat approaches.
+            if fraction<=.25 then return 255,255,255
+            elseif fraction<=.5 then return 102,210,95
+            elseif fraction<=.75 then return 255,210,55
+            else return 255,80,70 end
+        end
+        if fraction>.75 then return 255,255,255
+        elseif fraction>.5 then return 102,210,95
+        elseif fraction>.25 then return 255,210,55
+        else return 255,80,70 end
+    end
+    local function collect(c,records,frame,now)
+        local labels,seen={},{}
+        local basis={M.to_elements(c.pose)}
+        for i=1,9 do if not finite(basis[i]) then error('invalid camera basis') end end
+        local factor=2*math.tan(c.vertical_fov_radians/2)/c.viewport_height
+        for unit,p in pairs(peaks) do if now-p.seen>2 or now<p.seen then peaks[unit]=nil end end
+        for i=1,math.min(type(records)=='table' and #records or 0,128) do
+            local r=records[i]
+            if fresh(r,frame,now) and not seen[r.unit] and finite(r.x) and finite(r.y) and finite(r.z) then
+                local ok,alive=pcall(Unit.alive,r.unit)
+                local wok,uw=false,nil
+                if ok and alive==true then wok,uw=pcall(Unit.world,r.unit) end
+                if wok and uw==world then
+                    seen[r.unit]=true
+                    local text,fraction,kind=display_value(r,now)
+                    local x,y,z=r.x,r.y,r.z+head_offset
+                    local dx,dy,dz=x-c.x,y-c.y,z-c.z
+                    local depth=dx*c.forward_x+dy*c.forward_y+dz*c.forward_z
+                    local distance2=dx*dx+dy*dy+dz*dz
+                    if depth>c.near_range+.01 and distance2<=max_distance^2 then
+                        local scale=depth*factor
+                        local px=c.viewport_width/2+(dx*basis[1]+dy*basis[2]+dz*basis[3])/scale
+                        local py=c.viewport_height/2+(dx*basis[7]+dy*basis[8]+dz*basis[9])/scale
+                        local uv=valid_icon(r)
+                        -- Projection keeps the world anchor fixed. Only layout size changes.
+                        local distance=math.sqrt(distance2)
+                        local distance_scale=math.max(1,near_scale*math.min(1,near_distance/distance))
+                        -- Keep the selected range floor, but do not let it stop
+                        -- the main text-size control from reducing the label.
+                        local ui_scale=math.max(math.min(minimum_height,height)/height,
+                            c.viewport_height/reference_height*distance_scale)
+                        local column_width=bar_width+math.max(0,#text-4)*height*.7
+                        local width=column_width+(uv and frame_size+icon_gap or 0)
+                        local layout_height=math.max(height+bar_height+4,uv and frame_size or 0)
+                        if px+width*ui_scale/2>=0 and px-width*ui_scale/2<=c.viewport_width
+                            and py+layout_height*ui_scale>=0 and py<=c.viewport_height then
+                            labels[#labels+1]={x=x,y=y,z=z,scale=scale*ui_scale,ui_scale=ui_scale,distance2=distance2,
+                                text=text,uv=uv,width=width,column_width=column_width,index=i,
+                                fraction=fraction,kind=kind}
+                        end
+                    end
+                end
+            end
+        end
+        table.sort(labels,function(a,b)
+            if a.distance2==b.distance2 then return a.index<b.index end
+            return a.distance2<b.distance2
+        end)
+        return labels
+    end
+    local function measure(text)
+        local found=extents[text]
+        if found then return found end
+        local lo,hi=Gui.text_extents(gui,text,font,32)
+        local x0,y0=V2.to_elements(lo)
+        local x1,y1=V2.to_elements(hi)
+        if not finite(x0) or not finite(y0) or not finite(x1) or not finite(y1)
+            or x1<=x0 or y1<=y0 then error('invalid font extents') end
+        if extent_count>=256 then extents={};extent_count=0 end
+        found={x0=x0,y0=y0,x1=x1,y1=y1};extents[text]=found;extent_count=extent_count+1
+        return found
+    end
+    local function matrix(rotation,label,scale)
+        local tm=M.identity()
+        M.set_rotation(tm,rotation)
+        M.set_scale(tm,V3(scale,scale,scale))
+        M.set_translation(tm,V3(label.x,label.y,label.z))
+        return tm
+    end
+    local function render(c,labels)
+        if not font_ratio then
+            local box=measure('0123456789')
+            font_ratio=height/(box.y1-box.y0)
+        end
+        local rotation=M.rotation(c.pose)
+        -- Scale companion ink too: zero text/bar opacity must not leave a
+        -- floating shadow or dark track. Original defaults remain 85 and 65.
+        local shadow=Color(math.floor(85*text_alpha/185+.5),0,0,0)
+        local tint,track=Color(icon_alpha,255,255,255),Color(math.floor(65*bar_alpha/145+.5),43,43,43)
+        local frame_tint=Color(frame_alpha,255,255,255)
+        for _,l in ipairs(labels) do
+            if drawn>=max_labels then break end
+            local tm=matrix(rotation,l,l.scale)
+            local left=-l.width/2
+            local column=left+(l.uv and frame_size+icon_gap or 0)
+            local bar_y=l.uv and math.max(0,(frame_size-height-bar_height-4)/2) or 0
+            local red,green,blue=stage_rgb(l.kind,l.fraction)
+            local foreground=Color(text_alpha,red,green,blue)
+            local fill=Color(bar_alpha,red,green,blue)
+            local cells_left=column
+            local cell_width=(l.column_width-segment_gap*3)/4
+            local function bar(x,w,layer,color)
+                Gui.bitmap_3d_uv(gui,icon_material,V2(bar_uv.u0,bar_uv.v0),V2(bar_uv.u1,bar_uv.v1),
+                    tm,V3(x,bar_y,0),layer,V2(w,bar_height),color)
+                primitives=primitives+1
+            end
+            for segment=1,4 do
+                local x=cells_left+(segment-1)*(cell_width+segment_gap)
+                bar(x,cell_width,0,track)
+                local fraction=math.max(0,math.min(1,l.fraction*4-(segment-1)))
+                local fill_width=cell_width*fraction
+                if fill_width*l.ui_scale>=.03125 then bar(x,fill_width,1,fill) end
+            end
+            if l.uv then
+                -- Four short open corners; no filled plate behind the original artwork.
+                Gui.bitmap_3d_uv(gui,icon_material,V2(frame_uv.u0,frame_uv.v0),V2(frame_uv.u1,frame_uv.v1),
+                    tm,V3(left,0,0),0,V2(frame_size,frame_size),frame_tint)
+                local uv=l.uv
+                local padding=(frame_size-icon_size)/2
+                Gui.bitmap_3d_uv(gui,icon_material,V2(uv.u0,uv.v0),V2(uv.u1,uv.v1),
+                    tm,V3(left+padding,padding,0),1,V2(icon_size,icon_size),tint)
+                primitives=primitives+2;icons_drawn=icons_drawn+1
+            end
+            local box=measure(l.text)
+            local text_width=(box.x1-box.x0)*font_ratio
+            local tx=column+(l.column_width-text_width)/2-box.x0*font_ratio
+            local ty=bar_y+bar_height+4-box.y0*font_ratio
+            local text_tm=matrix(rotation,l,l.scale*font_ratio)
+            Gui.text_3d(gui,l.text,font,32,font_material,text_tm,
+                V3((tx+.65)/font_ratio,(ty-.65)/font_ratio,0),2,shadow)
+            Gui.text_3d(gui,l.text,font,32,font_material,text_tm,
+                V3(tx/font_ratio,ty/font_ratio,0),3,foreground)
+            primitives=primitives+2
+            drawn=drawn+1
+        end
+    end
+    local api={}
+    -- Only visual scalars may change. Assets, depth materials, network reads,
+    -- maximum record count, camera validation and GUI ownership stay fixed.
+    local option_bounds={
+        pixel_height={10,48},icon_size={12,64},
+        text_alpha={0,255},icon_alpha={0,255},bar_alpha={0,255},frame_alpha={0,255},
+        head_offset={0,10},near_scale={1,8},near_distance={1,30},
+        min_pixel_height={8,40},frame_scale={1.1,2},
+        bar_width={30,100},bar_height={1,6},max_distance={1,300},
+    }
+    function api.options()
+        return {pixel_height=height,icon_size=icon_size,
+            text_alpha=text_alpha,icon_alpha=icon_alpha,bar_alpha=bar_alpha,frame_alpha=frame_alpha,
+            head_offset=head_offset,near_scale=near_scale,near_distance=near_distance,
+            min_pixel_height=minimum_height,frame_scale=frame_scale,
+            bar_width=bar_width,bar_height=bar_height,max_distance=max_distance}
+    end
+    function api.configure(values)
+        if type(values)~='table' then return false,'visual_options_must_be_table' end
+        local next_values=api.options()
+        local changed=false
+        -- Validate the complete request first. A malformed field cannot partly
+        -- apply another field or cause a native call from the settings callback.
+        for name,value in pairs(values) do
+            local bounds=option_bounds[name]
+            if not bounds then return false,'unknown_visual_option:'..tostring(name) end
+            if not finite(value) then return false,'invalid_visual_option:'..name end
+            local adjusted=math.max(bounds[1],math.min(bounds[2],value))
+            if next_values[name]~=adjusted then changed=true end
+            next_values[name]=adjusted
+        end
+        if not changed then return false end
+        -- Font extents were measured at a fixed font size and remain valid;
+        -- only their scalar ratio depends on the selected pixel height.
+        if height~=next_values.pixel_height then font_ratio=nil end
+        height,icon_size=next_values.pixel_height,next_values.icon_size
+        text_alpha,icon_alpha=next_values.text_alpha,next_values.icon_alpha
+        bar_alpha,frame_alpha=next_values.bar_alpha,next_values.frame_alpha
+        head_offset=next_values.head_offset
+        near_scale,near_distance=next_values.near_scale,next_values.near_distance
+        minimum_height=next_values.min_pixel_height
+        frame_scale=next_values.frame_scale
+        frame_size=icon_size*frame_scale
+        bar_width,bar_height=next_values.bar_width,next_values.bar_height
+        max_distance=next_values.max_distance
+        return true
+    end
+    function api.reset(next_world)
+        dispose();world=next_world;disabled=false;logged={};peaks={}
+        extents,extent_count,font_ratio={},0,nil;assets_ready=false
+        drawn,eligible,primitives,icons_drawn=0,0,0,0
+        reason=world and 'awaiting_verified_camera' or 'no_world'
+    end
+    function api.update(c,records)
+        drawn,eligible,primitives,icons_drawn=0,0,0,0
+        if disabled then return end
+        if #missing>0 then reason='api_unavailable';log_once('api',table.concat(missing,', '));return end
+        if not world then reason='no_world';return end
+        if not live_world() then gui=nil;disabled=true;reason='world_no_longer_live';return end
+        if gui then local ok,err=pcall(Gui.reset,gui);if not ok then stop(err);return end end
+        local fok,frame=pcall(ot.frame);local tok,now=pcall(ot.time)
+        if not fok or not integer(frame,0,9007199254740991) or not tok or not finite(now) then
+            reason='time_unavailable';return
+        end
+        if not camera_valid(c,frame) then reason='awaiting_verified_camera';return end
+        local ok,list=pcall(collect,c,records,frame,now)
+        if not ok then stop(list);return end
+        eligible=#list
+        if eligible==0 then reason='awaiting_verified_ammo_in_range';return end
+        if not check_assets() then return end
+        if not gui then
+            local made,new_gui=call('create_world_gui',function()
+                return World.create_world_gui(world,M.identity(),1,1,'immediate')
+            end)
+            if not made or type(new_gui)~='userdata' then stop('create_world_gui: '..tostring(new_gui));return end
+            gui=new_gui
+        end
+        local rendered,err=call('render',render,c,list)
+        if not rendered then stop(err);return end
+        reason='submitted_depth_gui'
+    end
+    function api.shutdown()
+        dispose();world=nil;peaks={};disabled=false;assets_ready=false
+        reason='shutdown';drawn,eligible,primitives,icons_drawn=0,0,0,0
+    end
+    function api.status()
+        return {reason=reason,backend='world_gui_depth_materials',disabled=disabled,
+            submitted=drawn,eligible=eligible,primitives=primitives,icons=icons_drawn,
+            pixel_height=height,icon_size=icon_size,max_distance=max_distance,assets_ready=assets_ready,
+            near_scale=near_scale,near_distance=near_distance,min_pixel_height=minimum_height,
+            effective_min_pixel_height=math.min(minimum_height,height),
+            reference_viewport_height=reference_height,frame_size=frame_size,frame_scale=frame_scale,
+            text_alpha=text_alpha,icon_alpha=icon_alpha,bar_alpha=bar_alpha,frame_alpha=frame_alpha,
+            head_offset=head_offset,bar_width=bar_width,bar_height=bar_height,
+            bar_reference='estimated_highest_observed_sample',bar_segments=4,estimate_marker=false,
+            bar_backend='textured_depth_bitmap',game_validated=false}
+    end
+    return api
+end
+
+end)()
+local create_snapshot = (function()
+-- Bounded display snapshot of verified identities and explicitly sourced metrics.
+-- factory(ot,profile) -> capture(world,records), snapshot(world), clear(reason),
+-- reset(world), shutdown(), status(). Full sampling is scheduled by the caller.
+-- Samples expire after 80 ms; validation never renews their time/frame or reads
+-- or predicts metrics. Every render validates world/session, Unit/model, GOID/type,
+-- current 1 mm position agreement, and bidirectional uniqueness within the cohort.
+-- New unrelated objects are detected by full sampling, not this bounded cache.
+-- No full enumeration, setters, or retained native vectors.
+return function(ot,profile)
+    local S=ot.engine
+    local App,Unit,Net,GS,V3=S.Application or {},S.Unit or {},S.Network or {},S.GameSession or {},S.Vector3 or {}
+    local MAX_AGE,MAX_RECORDS,EPS2=0.08,128,0.001^2
+    local cache,world,session={},nil,nil
+    local sampled_frame,sample_time,expires_at,last_frame,last_time=nil,nil,nil,nil,nil
+    local reason,problem='empty',nil
+    local captures,validations,dropped,returned=0,0,0,0
+    local types,metric_specs={},{}
+    local metric_dropped,last_metric_drop=0,nil
+    local function finite(v) return type(v)=='number' and v==v and v>-math.huge and v<math.huge end
+    local function integer(v,lo,hi) return finite(v) and v%1==0 and v>=lo and v<=hi end
+    local function hex(v,width,pad)
+        if type(v)~='string' then return nil end
+        v=v:lower():gsub('^0x','')
+        if not v:match('^%x+$') or #v>width then return nil end
+        if pad then return string.rep('0',width-#v)..v end
+        v=v:gsub('^0+','');return v~='' and v or '0'
+    end
+    local function call(fn,...)
+        if type(fn)~='function' then return false,nil end
+        return pcall(fn,...)
+    end
+    local required={App.main_world,App.worlds,Unit.alive,Unit.world,Unit.debug_name,
+        Unit.world_position,Net.game_session,GS.game_object_exists,GS.game_object_is_type,
+        GS.game_object_field,V3.to_elements,ot.frame,ot.time}
+    for i=1,13 do if type(required[i])~='function' then problem='snapshot_api_unavailable' end end
+    if type(profile)=='table' and type(profile.types)=='table' then
+        for _,entry in ipairs(profile.types) do
+            if type(entry)=='table' then
+                local th=hex(entry.type_hash,8,true)
+                if th then metric_specs[th]=entry end
+            end
+        end
+    end
+    if type(profile)~='table' or type(profile.bindings)~='table' or #profile.bindings==0 then
+        problem='snapshot_bindings_unavailable'
+    else
+        for _,b in ipairs(profile.bindings) do
+            local model=type(b)=='table' and hex(b.model_hash,16,false)
+            local th=type(b)=='table' and hex(b.type_hash,8,true)
+            if not model or not th or type(b.call)~='string' or #b.call==0
+                or type(b.position_field)~='string' or #b.position_field==0
+                or hex(b.position_field_hash,8,true)~='9a9b14c4'
+                or type(b.fields)~='table' or not integer(b.position_slot,1,#b.fields)
+                or hex(b.fields[b.position_slot],8,true)~='9a9b14c4' then
+                problem='snapshot_invalid_binding';break
+            end
+            local spec=metric_specs[th] or b
+            local metric_kind=spec.metric_kind or 'ammo'
+            if (b.metric_kind~=nil and b.metric_kind~=metric_kind)
+                or (metric_kind~='ammo' and metric_kind~='heat' and metric_kind~='lifetime')
+                or (metric_kind=='heat' and (not finite(spec.static_heat_threshold) or spec.static_heat_threshold<=0
+                    or not finite(spec.schema_min) or not finite(spec.schema_max) or spec.schema_min>spec.schema_max))
+                or (metric_kind=='lifetime' and (not finite(spec.estimated_lifetime_seconds) or spec.estimated_lifetime_seconds<=0)) then
+                problem='snapshot_invalid_metric_binding';break
+            end
+            local kind=types[th]
+            if kind and (kind.call~=b.call or kind.position_field~=b.position_field or kind.metric_kind~=metric_kind) then
+                problem='snapshot_conflicting_binding';break
+            end
+            if not kind then
+                kind={call=b.call,position_field=b.position_field,models={},metric_kind=metric_kind,
+                    metric_min=spec.schema_min,metric_max=spec.schema_max,
+                    heat_threshold=spec.static_heat_threshold,lifetime_seconds=spec.estimated_lifetime_seconds}
+                types[th]=kind
+            end
+            kind.models[model]=true
+        end
+    end
+    local api={}
+    function api.clear(why)
+        cache,session={},nil
+        sampled_frame,sample_time,expires_at=nil,nil,nil
+        returned=0;last_metric_drop=nil;reason=why or 'cleared'
+    end
+    function api.reset(next_world)
+        api.clear(next_world and 'awaiting_capture' or 'no_world')
+        world=next_world;last_frame,last_time=nil,nil
+    end
+    local function reject(why) api.clear(why);return nil,why end
+    local function context(requested_world)
+        if problem then return reject(problem) end
+        local fok,frame=call(ot.frame);local tok,now=call(ot.time)
+        if not fok or not integer(frame,0,9007199254740991) or not tok or not finite(now) then
+            return reject('snapshot_time_unavailable')
+        end
+        if (last_frame and frame<last_frame) or (last_time and now<last_time) then
+            last_frame,last_time=frame,now;return reject('snapshot_time_reversed')
+        end
+        last_frame,last_time=frame,now
+        if requested_world==nil then return reject('snapshot_no_world') end
+        local mok,main=call(App.main_world)
+        local wok,worlds=call(App.worlds)
+        local live=false
+        if wok and type(worlds)=='table' then
+            for _,w in pairs(worlds) do if w==requested_world then live=true;break end end
+        end
+        if not mok or main~=requested_world or not live then return reject('snapshot_world_unavailable') end
+        local sok,current=call(Net.game_session)
+        if not sok or current==nil then return reject('snapshot_session_unavailable') end
+        return {frame=frame,now=now,session=current,world=requested_world}
+    end
+    local function unit_model(unit,expected_world)
+        -- Never send a destroyed Unit to a later API.
+        local aok,alive=call(Unit.alive,unit)
+        if not aok or alive~=true then return nil,'snapshot_unit_destroyed' end
+        local wok,uw=call(Unit.world,unit)
+        if not wok or uw~=expected_world then return nil,'snapshot_unit_world_changed' end
+        local nok,name=call(Unit.debug_name,unit)
+        local model=nok and type(name)=='string' and name:match('#ID%[(%x+)%]')
+        if not model then return nil,'snapshot_unit_model_unavailable' end
+        return hex(model,16,false)
+    end
+    local function auxiliary(value)
+        if type(value)~='table' then return nil end
+        local out={}
+        for _,key in ipairs({'magazines_remaining','chamber_empty','is_overheated'}) do
+            local v=value[key]
+            if type(v)=='boolean' or finite(v) then out[key]=v end
+        end
+        return out
+    end
+    -- Only these scalar fields cross the sampling/render boundary. No mutable
+    -- metric tables or native vectors are retained, and no renderer time is used
+    -- to recalculate a value. Legacy ammo records remain valid without metadata.
+    local metric_keys={'metric_kind','metric_value','metric_value_verified','metric_max',
+        'metric_max_source','metric_max_verified','metric_max_sampled_frame','metric_estimated',
+        'metric_estimate_basis','temperature','static_heat_threshold','first_verified_observation_time'}
+    local function metric_record(r,kind,ctx)
+        local mk=r.metric_kind or 'ammo'
+        if mk~=kind.metric_kind then return nil end
+        if mk=='ammo' then
+            if r.source~='network.rounds_remaining' or not integer(r.rounds,0,2147483647)
+                or (r.metric_value~=nil and r.metric_value~=r.rounds)
+                or (r.metric_value_verified~=nil and r.metric_value_verified~=true)
+                or r.metric_max~=nil or r.metric_max_source~=nil or r.metric_max_sampled_frame~=nil
+                or (r.metric_max_verified~=nil and r.metric_max_verified~=false)
+                or (r.metric_estimated~=nil and r.metric_estimated~=false)
+                or r.metric_estimate_basis~=nil or r.temperature~=nil
+                or r.static_heat_threshold~=nil or r.first_verified_observation_time~=nil then return nil end
+            return {metric_kind='ammo',metric_value=r.rounds,metric_value_verified=true,metric_max_verified=false}
+        end
+        if r.rounds~=nil or not finite(r.metric_value) or r.metric_value<0
+            or r.metric_max_verified~=false or r.metric_estimated~=true
+            or r.metric_max_sampled_frame~=ctx.frame then return nil end
+        if mk=='heat' then
+            if r.source~='network.temperature' or r.metric_value_verified~=true
+                or r.metric_value<kind.metric_min or r.metric_value>kind.metric_max
+                or r.metric_max~=kind.heat_threshold or r.metric_max_source~='static_overheat_threshold'
+                or r.metric_estimate_basis~='static_overheat_threshold'
+                or (r.temperature~=nil and r.temperature~=r.metric_value)
+                or (r.static_heat_threshold~=nil and r.static_heat_threshold~=kind.heat_threshold)
+                or r.first_verified_observation_time~=nil then return nil end
+        else
+            if r.source~='estimated.deployment_remaining' or r.metric_value_verified~=false
+                or r.metric_max~=kind.lifetime_seconds or r.metric_value>kind.lifetime_seconds
+                or r.metric_max_source~='static_lifetime' or r.metric_estimate_basis~='first_verified_observation'
+                or not finite(r.first_verified_observation_time) or r.first_verified_observation_time>ctx.now
+                or r.temperature~=nil or r.static_heat_threshold~=nil then return nil end
+        end
+        local out={}
+        for _,key in ipairs(metric_keys) do out[key]=r[key] end
+        return out
+    end
+    local function copy_record(r)
+        local out={verified=true,unit=r.unit,world=r.world,rounds=r.rounds,
+            sampled_frame=r.sampled_frame,sample_time=r.sample_time,expires_at=r.expires_at,
+            session=r.session,model_hash=r.model_hash,network_goid=r.network_goid,network_type=r.network_type,
+            source=r.source,schema_sha256=r.schema_sha256,identity_basis=r.identity_basis,
+            identity_inferred=r.identity_inferred,auxiliary_sample_frame=r.auxiliary_sample_frame,
+            auxiliary=auxiliary(r.auxiliary)}
+        for _,key in ipairs(metric_keys) do out[key]=r[key] end
+        return out
+    end
+    function api.capture(next_world,records)
+        local ctx,why=context(next_world)
+        if not ctx then return false,why end
+        if type(records)~='table' or #records>MAX_RECORDS then return reject('snapshot_invalid_records') end
+        local count=0
+        for index in pairs(records) do
+            count=count+1
+            if not integer(index,1,#records) then return reject('snapshot_sparse_records') end
+        end
+        if count~=#records then return reject('snapshot_sparse_records') end
+        if #records==0 then api.clear('snapshot_empty_source');world=next_world;return true end
+        local next_cache,units,ids={},{},{}
+        last_metric_drop=nil
+        for _,r in ipairs(records) do
+            if type(r)~='table' or r.verified~=true or r.short_snapshot==true
+                or r.sampled_frame~=ctx.frame or r.world~=next_world or type(r.unit)~='userdata'
+                or not integer(r.network_goid,0,2147483647)
+                or r.network_goid==32767 or not finite(r.x) or not finite(r.y) or not finite(r.z)
+                or (r.session~=nil and r.session~=ctx.session)
+                or (profile.schema_sha256~=nil and r.schema_sha256~=profile.schema_sha256) then
+                return reject('snapshot_source_not_current_network_sample')
+            end
+            local model,err=unit_model(r.unit,next_world)
+            if not model then return reject(err) end
+            local th=hex(r.network_type,8,true);local kind=types[th]
+            if not kind or not kind.models[model] or (r.model_hash~=nil and hex(r.model_hash,16,false)~=model) then
+                return reject('snapshot_model_type_mismatch')
+            end
+            if units[r.unit] or ids[r.network_goid] then return reject('snapshot_duplicate_source_identity') end
+            units[r.unit],ids[r.network_goid]=true,true
+            local metric=metric_record(r,kind,ctx)
+            if metric then
+                local saved=copy_record(r)
+                for _,key in ipairs(metric_keys) do saved[key]=metric[key] end
+                saved.model_hash,saved.network_type,saved.session=model,th,ctx.session
+                saved.sample_time,saved.expires_at=ctx.now,ctx.now+MAX_AGE
+                next_cache[#next_cache+1]=saved
+            else
+                dropped=dropped+1;metric_dropped=metric_dropped+1
+                last_metric_drop='snapshot_invalid_metric'
+            end
+        end
+        cache,world,session=next_cache,next_world,ctx.session
+        sampled_frame,sample_time,expires_at=ctx.frame,ctx.now,ctx.now+MAX_AGE
+        captures=captures+1;reason=last_metric_drop or 'captured';returned=0
+        return true
+    end
+    local function xyz(fn,...)
+        local ok,p=call(fn,...)
+        if not ok or p==nil then return nil end
+        local vok,x,y,z=call(V3.to_elements,p)
+        if vok and finite(x) and finite(y) and finite(z) then return {x=x,y=y,z=z} end
+    end
+    local function distance(a,b) return (a.x-b.x)^2+(a.y-b.y)^2+(a.z-b.z)^2 end
+    local function validate(r,ctx)
+        local model,why=unit_model(r.unit,ctx.world)
+        if not model then return nil,why end
+        if model~=r.model_hash then return nil,'snapshot_unit_model_changed' end
+        local kind=types[r.network_type]
+        local eok,exists=call(GS.game_object_exists,ctx.session,r.network_goid)
+        if not eok or exists~=true then return nil,'snapshot_object_gone' end
+        local tok,match=call(GS.game_object_is_type,ctx.session,r.network_goid,kind.call)
+        if not tok or match~=true then return nil,'snapshot_object_type_changed' end
+        local up=xyz(Unit.world_position,r.unit,1)
+        local np=xyz(GS.game_object_field,ctx.session,r.network_goid,kind.position_field)
+        if not up or not np then return nil,'snapshot_position_unavailable' end
+        return {record=r,unit_position=up,network_position=np,kind=kind,pair_matches=distance(up,np)<=EPS2}
+    end
+    function api.snapshot(requested_world)
+        validations=validations+1;returned=0
+        local ctx,why=context(requested_world)
+        if not ctx then return {},why end
+        if requested_world~=world then api.clear('snapshot_world_changed');return {},reason end
+        if #cache==0 then return {},reason end
+        if ctx.session~=session then api.clear('snapshot_session_changed');return {},reason end
+        if ctx.frame<sampled_frame or ctx.now<sample_time then api.clear('snapshot_time_reversed');return {},reason end
+        if ctx.now>=expires_at then api.clear('snapshot_expired');return {},reason end
+        local valid,first_drop={},nil
+        for _,r in ipairs(cache) do
+            local item,err=validate(r,ctx)
+            if item then valid[#valid+1]=item else dropped=dropped+1;first_drop=first_drop or err end
+        end
+        -- Drop every ambiguous participant; never redirect a saved Unit to a
+        -- different GOID, even when the pair would match its current position.
+        local unit_counts,id_counts={},{}
+        for i,u in ipairs(valid) do
+            for j,n in ipairs(valid) do
+                if n.kind.models[u.record.model_hash] and distance(u.unit_position,n.network_position)<=EPS2 then
+                    unit_counts[i]=(unit_counts[i] or 0)+1;id_counts[j]=(id_counts[j] or 0)+1
+                end
+            end
+        end
+        local retained,out={},{}
+        for i,item in ipairs(valid) do
+            if item.pair_matches and unit_counts[i]==1 and id_counts[i]==1 then
+                local saved=item.record;retained[#retained+1]=saved
+                local r=copy_record(saved)
+                r.x,r.y,r.z=item.unit_position.x,item.unit_position.y,item.unit_position.z
+                r.validation_frame,r.position_frame=ctx.frame,ctx.frame
+                r.short_snapshot,r.snapshot_age,r.max_age_seconds=true,ctx.now-r.sample_time,MAX_AGE
+                out[#out+1]=r
+            else dropped=dropped+1;first_drop=first_drop or (not item.pair_matches and 'snapshot_position_mismatch' or 'snapshot_ambiguous_cohort') end
+        end
+        cache=retained;returned=#out
+        reason=first_drop or (#out>0 and 'validated_short_snapshot' or 'snapshot_empty')
+        return out,reason
+    end
+    function api.shutdown() api.reset(nil);reason='shutdown' end
+    function api.status()
+        return {reason=reason,records=#cache,returned=returned,captures=captures,validations=validations,
+            dropped=dropped,metric_dropped=metric_dropped,last_metric_drop=last_metric_drop,sampled_frame=sampled_frame,sample_time=sample_time,expires_at=expires_at,
+            validation_frame=last_frame,max_age_seconds=MAX_AGE,max_records=MAX_RECORDS,
+            identity_basis='retained_sample_with_current_identity_and_cohort_checks'}
+    end
+    return api
+end
+
+end)()
+local network_profile = (function()
+-- Generated from this install's network_config and EntitySettings/UnitComponentData.
+-- String aliases use normal engine ID32 names, with full live schema checks.
+-- The high precision Vector3 field's position semantics require live validation.
+-- Laser temperature is raw; its 250 normalization threshold is explicitly estimated.
+-- Tesla lifetime is an explicit 150s estimate from first verified observation, not birth.
+return {
+    steam_build='26088801',
+    schema_sha256='1c49360016a54b682cc3604a9fb10aef4d97a189529a4c485d92454102ffebed',
+    entity_data_sha256='c27d9d350b6f6138f9a040266d98958c8a755ef1b77e965d669c7b263178e15b',
+    typelib_sha256='6cc78f1a8323d82cc319ba3f378b0dbf692f8ede3703cd0873f7e212ce11a18a',
+    field_name='rounds_remaining', field_hash='d7a5d63e',
+    models={['2b11c9e4980ec479']=true,['37079568dc86e9c6']=true,['37cde43876ba26bb']=true,['51a0812e3bce2d74']=true,['56070f36cfffa8a8']=true,['61d9dda22a59e9bc']=true,['74599e56f72f9d7e']=true,['820cc3bafe962858']=true,['cbfe1fc7158347f3']=true,['e977c49db7604f9']=true},
+    model_resources={['2b11c9e4980ec479']='content/fac_helldivers/hellpod/antitank_emplacement/antitank_emplacement',['37079568dc86e9c6']='content/fac_helldivers/hellpod/rocket_turret/rocket_turret',['37cde43876ba26bb']='content/fac_helldivers/hellpod/turret_machinegun_gpmg/turret_machinegun_gpmg',['51a0812e3bce2d74']='content/fac_helldivers/hellpod/mortar_turret/mortar_turret',['56070f36cfffa8a8']='content/fac_helldivers/hellpod/laser_cannon_turret/laser_cannon_turret',['61d9dda22a59e9bc']='content/fac_helldivers/hellpod/turret/turret',['74599e56f72f9d7e']='content/fac_helldivers/hellpod/tesla_turret/tesla_turret',['820cc3bafe962858']='content/fac_helldivers/hellpod/flamethrower_turret/flamethrower_turret',['cbfe1fc7158347f3']='content/fac_helldivers/hellpod/aa_turret/aa_turret',['e977c49db7604f9']='content/fac_helldivers/hellpod/manned_turret/manned_turret'},
+    types={
+        {type_hash='0162dd9e',call='zdZ~yhg!',rounds_slot=39,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','6f3ab277','4cbcc2a2','7030c54e','b741b700','5e5865a0'}},
+        {type_hash='13a71430',call='Es}/~kND',rounds_slot=39,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','6f3ab277','4cbcc2a2','7030c54e'}},
+        {type_hash='14c9c273',call='i1j-1MHz',metric_kind='lifetime',estimated_lifetime_seconds=150,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','7030c54e'}},
+        {type_hash='2363e364',call='T[tD_-{~',rounds_slot=39,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','6f3ab277','4cbcc2a2','7030c54e'}},
+        {type_hash='2596fa0a',call='N+d%Kq$1',rounds_slot=39,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf'}},
+        {type_hash='3416fff4',call='4%EXhX(8',rounds_slot=39,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','6f3ab277','4cbcc2a2','7030c54e'}},
+        {type_hash='3ae02f80',call='mZ(LD/!&',rounds_slot=39,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','7030c54e'}},
+        {type_hash='3bd04c18',call='941ND^v~',rounds_slot=39,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','67526982','31182caf','3132608f','788b9753','99901914','1dd07f05','39d141d6','ac08fe53','7a4bdbbe','5dd8181b','b6347304','d7082cbf','6d2d83f8','7d9563dd','d8819b3e','49c250a6','31f86165','09d8bef4','6f3ab277','4cbcc2a2','7030c54e','95c46304','ec64918b','d7a5d63e','4a893e74','6fa852e3','c4c9b9ef'}},
+        {type_hash='3c709c50',call='):e&;~2_',rounds_slot=39,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','6f3ab277','4cbcc2a2','7030c54e','b741b700'}},
+        {type_hash='6d3f8345',call='oYVe)p+i',rounds_slot=31,fields={'50ac6619','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','6f3ab277','4cbcc2a2','7030c54e','b741b700'}},
+        {type_hash='947ed108',call='JMR4x`Ao',rounds_slot=35,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','3132608f','788b9753','99901914','1dd07f05','39d141d6','ac08fe53','7a4bdbbe','5dd8181b','b6347304','d7082cbf','6d2d83f8','7d9563dd','d8819b3e','49c250a6','31f86165','09d8bef4','7030c54e','95c46304','ec64918b','d7a5d63e','4a893e74','6fa852e3'}},
+        {type_hash='992ff297',call='G`Y1$voS',rounds_slot=37,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','3132608f','788b9753','99901914','1dd07f05','39d141d6','ac08fe53','7a4bdbbe','5dd8181b','b6347304','d7082cbf','6d2d83f8','7d9563dd','d8819b3e','49c250a6','31f86165','09d8bef4','6f3ab277','4cbcc2a2','7030c54e','95c46304','ec64918b','d7a5d63e','4a893e74','6fa852e3'}},
+        {type_hash='9d474323',call='Og,VB9b3',metric_kind='heat',metric_slot=41,schema_bits=7,schema_min=0,schema_max=4000,static_heat_threshold=250,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','67526982','31182caf','ec64918b','a5023836','f6275c53','88b7cf6d'}},
+        {type_hash='9fdd94c0',call='}>|mEsa.',rounds_slot=39,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','6f3ab277','4cbcc2a2','7030c54e'}},
+        {type_hash='a37f0894',call='$Leg(yqP',rounds_slot=39,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','6f3ab277','4cbcc2a2','7030c54e'}},
+        {type_hash='b551b138',call='ok$F9qrS',rounds_slot=39,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','6f3ab277','4cbcc2a2','7030c54e','b741b700'}},
+        {type_hash='be95e875',call='9I~t$THc',rounds_slot=39,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','6f3ab277','4cbcc2a2','7030c54e'}},
+        {type_hash='bf35608c',call='Mm{:#c*%',rounds_slot=39,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','67526982','31182caf','3132608f','788b9753','99901914','1dd07f05','39d141d6','ac08fe53','7a4bdbbe','5dd8181b','b6347304','d7082cbf','6d2d83f8','7d9563dd','d8819b3e','49c250a6','31f86165','09d8bef4','6f3ab277','4cbcc2a2','7030c54e','95c46304','ec64918b','d7a5d63e','4a893e74','6fa852e3','c4c9b9ef'}},
+        {type_hash='ec516bbd',call='<j9*h3.S',rounds_slot=39,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','6f3ab277','4cbcc2a2','7030c54e'}},
+        {type_hash='ee956607',call='<3hkntZ?',rounds_slot=37,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','3132608f','788b9753','99901914','1dd07f05','39d141d6','ac08fe53','7a4bdbbe','5dd8181b','b6347304','d7082cbf','6d2d83f8','7d9563dd','d8819b3e','49c250a6','31f86165','09d8bef4','6f3ab277','4cbcc2a2','7030c54e','95c46304','ec64918b','d7a5d63e','4a893e74','6fa852e3'}},
+        {type_hash='ef108792',call='tXoU]Yb{',rounds_slot=39,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','6f3ab277','4cbcc2a2','7030c54e','b741b700'}},
+        {type_hash='f1dbc135',call='h:(x&X8#',rounds_slot=38,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','c20428c6','6d1d5cfb','67526982','31182caf','3132608f','788b9753','99901914','1dd07f05','39d141d6','ac08fe53','7a4bdbbe','5dd8181b','b6347304','d7082cbf','6d2d83f8','7d9563dd','d8819b3e','49c250a6','31f86165','09d8bef4','6f3ab277','4cbcc2a2','7030c54e','95c46304','ec64918b','d7a5d63e','4a893e74','6fa852e3','c4c9b9ef'}},
+        {type_hash='f53d4725',call='f$XD&/}6',rounds_slot=39,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','6f3ab277','4cbcc2a2','7030c54e'}},
+    },
+    bindings={
+        {model_hash='61d9dda22a59e9bc',type_hash='3c709c50',call='):e&;~2_',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','6f3ab277','4cbcc2a2','7030c54e','b741b700'}},
+        {model_hash='51a0812e3bce2d74',type_hash='3416fff4',call='4%EXhX(8',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','6f3ab277','4cbcc2a2','7030c54e'}},
+        {model_hash='61d9dda22a59e9bc',type_hash='ef108792',call='tXoU]Yb{',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','6f3ab277','4cbcc2a2','7030c54e','b741b700'}},
+        {model_hash='51a0812e3bce2d74',type_hash='ec516bbd',call='<j9*h3.S',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','6f3ab277','4cbcc2a2','7030c54e'}},
+        {model_hash='61d9dda22a59e9bc',type_hash='6d3f8345',call='oYVe)p+i',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=3,position_semantics_verified=false,fields={'50ac6619','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','6f3ab277','4cbcc2a2','7030c54e','b741b700'}},
+        {model_hash='37079568dc86e9c6',type_hash='be95e875',call='9I~t$THc',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','6f3ab277','4cbcc2a2','7030c54e'}},
+        {model_hash='e977c49db7604f9',type_hash='f1dbc135',call='h:(x&X8#',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','c20428c6','6d1d5cfb','67526982','31182caf','3132608f','788b9753','99901914','1dd07f05','39d141d6','ac08fe53','7a4bdbbe','5dd8181b','b6347304','d7082cbf','6d2d83f8','7d9563dd','d8819b3e','49c250a6','31f86165','09d8bef4','6f3ab277','4cbcc2a2','7030c54e','95c46304','ec64918b','d7a5d63e','4a893e74','6fa852e3','c4c9b9ef'}},
+        {model_hash='56070f36cfffa8a8',type_hash='9d474323',call='Og,VB9b3',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','67526982','31182caf','ec64918b','a5023836','f6275c53','88b7cf6d'}},
+        {model_hash='e977c49db7604f9',type_hash='bf35608c',call='Mm{:#c*%',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','67526982','31182caf','3132608f','788b9753','99901914','1dd07f05','39d141d6','ac08fe53','7a4bdbbe','5dd8181b','b6347304','d7082cbf','6d2d83f8','7d9563dd','d8819b3e','49c250a6','31f86165','09d8bef4','6f3ab277','4cbcc2a2','7030c54e','95c46304','ec64918b','d7a5d63e','4a893e74','6fa852e3','c4c9b9ef'}},
+        {model_hash='e977c49db7604f9',type_hash='992ff297',call='G`Y1$voS',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','3132608f','788b9753','99901914','1dd07f05','39d141d6','ac08fe53','7a4bdbbe','5dd8181b','b6347304','d7082cbf','6d2d83f8','7d9563dd','d8819b3e','49c250a6','31f86165','09d8bef4','6f3ab277','4cbcc2a2','7030c54e','95c46304','ec64918b','d7a5d63e','4a893e74','6fa852e3'}},
+        {model_hash='37cde43876ba26bb',type_hash='13a71430',call='Es}/~kND',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','6f3ab277','4cbcc2a2','7030c54e'}},
+        {model_hash='e977c49db7604f9',type_hash='947ed108',call='JMR4x`Ao',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','3132608f','788b9753','99901914','1dd07f05','39d141d6','ac08fe53','7a4bdbbe','5dd8181b','b6347304','d7082cbf','6d2d83f8','7d9563dd','d8819b3e','49c250a6','31f86165','09d8bef4','7030c54e','95c46304','ec64918b','d7a5d63e','4a893e74','6fa852e3'}},
+        {model_hash='cbfe1fc7158347f3',type_hash='9fdd94c0',call='}>|mEsa.',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','6f3ab277','4cbcc2a2','7030c54e'}},
+        {model_hash='cbfe1fc7158347f3',type_hash='a37f0894',call='$Leg(yqP',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','6f3ab277','4cbcc2a2','7030c54e'}},
+        {model_hash='820cc3bafe962858',type_hash='3ae02f80',call='mZ(LD/!&',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','7030c54e'}},
+        {model_hash='61d9dda22a59e9bc',type_hash='b551b138',call='ok$F9qrS',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','6f3ab277','4cbcc2a2','7030c54e','b741b700'}},
+        {model_hash='37cde43876ba26bb',type_hash='f53d4725',call='f$XD&/}6',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','6f3ab277','4cbcc2a2','7030c54e'}},
+        {model_hash='51a0812e3bce2d74',type_hash='2363e364',call='T[tD_-{~',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','6f3ab277','4cbcc2a2','7030c54e'}},
+        {model_hash='61d9dda22a59e9bc',type_hash='2596fa0a',call='N+d%Kq$1',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf'}},
+        {model_hash='2b11c9e4980ec479',type_hash='3bd04c18',call='941ND^v~',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','67526982','31182caf','3132608f','788b9753','99901914','1dd07f05','39d141d6','ac08fe53','7a4bdbbe','5dd8181b','b6347304','d7082cbf','6d2d83f8','7d9563dd','d8819b3e','49c250a6','31f86165','09d8bef4','6f3ab277','4cbcc2a2','7030c54e','95c46304','ec64918b','d7a5d63e','4a893e74','6fa852e3','c4c9b9ef'}},
+        {model_hash='e977c49db7604f9',type_hash='ee956607',call='<3hkntZ?',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','3132608f','788b9753','99901914','1dd07f05','39d141d6','ac08fe53','7a4bdbbe','5dd8181b','b6347304','d7082cbf','6d2d83f8','7d9563dd','d8819b3e','49c250a6','31f86165','09d8bef4','6f3ab277','4cbcc2a2','7030c54e','95c46304','ec64918b','d7a5d63e','4a893e74','6fa852e3'}},
+        {model_hash='61d9dda22a59e9bc',type_hash='0162dd9e',call='zdZ~yhg!',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','6f3ab277','4cbcc2a2','7030c54e','b741b700','5e5865a0'}},
+        {model_hash='74599e56f72f9d7e',type_hash='14c9c273',call='i1j-1MHz',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','7030c54e'}},
+    },
+}
+
+end)()
+local create_visual_settings = (function()
+-- Optional MDL3 menu bridge. The sentry's existing loader owns rendering.
+-- MDL's ModOptionsMenu provider owns persistence; this module only polls
+-- validated visual scalars. No callbacks are registered or retained by MDL.
+local PREFIX='sentry_ammo.visual.'
+local MOD_ID='sentry_ammo_overhead'
+local MOD_TITLE='炮塔头顶弹药显示'
+local POLL_SECONDS=0.5
+
+local function finite(v)
+    return type(v)=='number' and v==v and v>-math.huge and v<math.huge
+end
+
+local DEFINITIONS={
+    {key='pixel_height',label='数字基础字号（像素）',min=10,max=48,step=1,default=24,
+        description='设置数字的基础高度；近距离放大和远距离最小字号会共同影响最终大小。'},
+    {key='icon_size',label='战备图标大小（像素）',min=12,max=64,step=1,default=36,
+        description='调整炮塔战备图标大小，保留游戏原有图案和颜色。'},
+    {key='text_alpha',label='数字不透明度（%）',min=0,max=100,step=0.1,default=185,alpha=true,gap=true,
+        description='0%完全透明，100%完全不透明。'},
+    {key='icon_alpha',label='图标不透明度（%）',min=0,max=100,step=0.1,default=145,alpha=true,
+        description='0%完全透明，100%完全不透明。'},
+    {key='bar_alpha',label='弹药条不透明度（%）',min=0,max=100,step=0.1,default=145,alpha=true,
+        description='同时调整四格弹药条和底轨的不透明度。'},
+    {key='frame_alpha',label='装饰框不透明度（%）',min=0,max=100,step=0.1,default=90,alpha=true,
+        description='调整战备图标周围装饰框的不透明度。'},
+    {key='head_offset',label='头顶显示高度（米）',min=0,max=10,step=0.1,default=2.5,gap=true,
+        description='调整整组显示相对炮塔位置的高度。'},
+    {key='near_scale',label='近距离放大倍数',min=1,max=8,step=0.1,default=4.5,
+        description='近距离最大放大倍数；1表示不额外放大。'},
+    {key='near_distance',label='近距离放大范围（米）',min=1,max=30,step=1,default=8,
+        description='此距离内使用最大放大倍数，超出后逐渐缩小。'},
+    {key='min_pixel_height',label='远距离最小字号（像素）',min=8,max=40,step=1,default=22,
+        description='保持远处数字可读；实际最小字号不超过数字基础字号。'},
+    {key='frame_scale',label='装饰框相对大小',min=1.1,max=2,step=0.1,default=1.4,gap=true,
+        description='相对于战备图标的大小倍数。'},
+    {key='bar_width',label='弹药条宽度（像素）',min=30,max=100,step=1,default=64,
+        description='调整四格弹药条的总宽度。'},
+    {key='bar_height',label='弹药条高度（像素）',min=1,max=6,step=1,default=3,
+        description='调整四格弹药条的高度。'},
+    {key='max_distance',label='最远显示距离（米）',min=1,max=300,step=1,default=120,gap=true,
+        description='超过此距离不显示炮塔弹药；增大可能增加显示数量和开销。'},
+}
+
+local function snap(def,value)
+    local steps=math.floor((value-def.min)/def.step+0.5)
+    return math.max(def.min,math.min(def.max,def.min+steps*def.step))
+end
+
+local function ui_default(def,defaults)
+    local value=defaults[def.key]
+    local lo,hi=def.min,def.max
+    if def.alpha then lo,hi=0,255 end
+    if not finite(value) or value<lo or value>hi then value=def.default end
+    if def.alpha then value=value*100/255 end
+    return snap(def,value)
+end
+
+local function renderer_value(def,value)
+    if not finite(value) or value<def.min or value>def.max then return nil end
+    -- Reject malformed API values instead of silently changing the saved value.
+    local adjusted=snap(def,value)
+    if math.abs(adjusted-value)>1e-5 then return nil end
+    if def.alpha then return math.floor(adjusted*255/100+0.5) end
+    return adjusted
+end
+
+return function(ot,labels,defaults)
+    ot=type(ot)=='table' and ot or {}
+    defaults=type(defaults)=='table' and defaults or {}
+    local api={}
+    local stopped=false
+    local elapsed=POLL_SECONDS
+    local current_menu=nil
+    local applied={}
+    local logged={}
+    local states=setmetatable({},{__mode='k'})
+    local reason='awaiting_mdl3'
+    local registration_count=0
+    local specs={}
+    for index,def in ipairs(DEFINITIONS) do
+        specs[index]={type='slider',label=def.label,mod=MOD_TITLE,mod_id=MOD_ID,
+            description=def.description,min=def.min,max=def.max,step=def.step,
+            default=ui_default(def,defaults),gap=def.gap==true}
+    end
+
+    local function log_once(key,message)
+        if logged[key] then return end
+        logged[key]=true
+        if type(ot.log)=='function' then pcall(ot.log,'SENTRY-SETTINGS %s',message) end
+    end
+
+    local function lookup()
+        if type(ot.options_menu)~='function' then return nil end
+        local ok,menu=pcall(ot.options_menu)
+        if not ok or type(menu)~='table' or menu.provider~='MDL' then return nil end
+        if type(menu.register_option)~='function' or type(menu.get)~='function' then return nil end
+        if type(menu.ready)=='function' then
+            local ready_ok,ready=pcall(menu.ready)
+            if not ready_ok or not ready then return nil end
+        end
+        return menu
+    end
+
+    local function poll()
+        local menu=lookup()
+        if not menu then
+            current_menu=nil
+            reason='awaiting_mdl3'
+            return
+        end
+        local state=states[menu]
+        if not state then
+            state={registered={},failed={}}
+            states[menu]=state
+            for index,def in ipairs(DEFINITIONS) do
+                local id=PREFIX..def.key
+                local ok,registered,err=pcall(menu.register_option,id,specs[index])
+                if ok and registered==true then
+                    state.registered[index]=true
+                    registration_count=registration_count+1
+                else
+                    state.failed[index]=true
+                    log_once('register:'..id,'option registration failed: '..id..' ('..tostring(ok and err or registered)..')')
+                end
+            end
+        end
+        if current_menu~=menu then
+            current_menu=menu
+            applied={}
+        end
+        local patch={}
+        local has_changes=false
+        local invalid=false
+        for index,def in ipairs(DEFINITIONS) do
+            if state.registered[index] then
+                local id=PREFIX..def.key
+                local ok,value=pcall(menu.get,id)
+                value=ok and renderer_value(def,value) or nil
+                if value==nil then
+                    invalid=true
+                    log_once('invalid:'..id,'invalid stored visual value ignored: '..id)
+                elseif applied[def.key]~=value then
+                    patch[def.key]=value
+                    has_changes=true
+                end
+            end
+        end
+        reason=next(state.failed) and 'partial_registration' or invalid and 'invalid_option' or 'ready'
+        if has_changes then
+            if type(labels)~='table' or type(labels.configure)~='function' then
+                reason='renderer_unavailable'
+                return
+            end
+            local ok,changed,err=pcall(labels.configure,patch)
+            if not ok or changed==false and err~=nil then
+                reason='configure_failed'
+                log_once('configure','visual settings update failed: '..tostring(ok and err or changed))
+                return
+            end
+            for key,value in pairs(patch) do applied[key]=value end
+        end
+        if reason=='ready' then
+            log_once('ready','MDL3 visual options ready; 14 settings; persistence provided by MDL3')
+        end
+    end
+
+    function api.update(dt)
+        if stopped then return end
+        if not finite(dt) or dt<0 then dt=0 end
+        elapsed=elapsed+math.min(dt,POLL_SECONDS)
+        if elapsed<POLL_SECONDS then return end
+        elapsed=0
+        poll()
+    end
+
+    function api.shutdown()
+        stopped=true
+        current_menu=nil
+        states=setmetatable({},{__mode='k'})
+        applied={}
+        reason='stopped'
+    end
+
+    function api.status()
+        return {reason=reason,registered=registration_count,option_count=#DEFINITIONS,
+            poll_seconds=POLL_SECONDS,provider='MDL',active=current_menu~=nil and not stopped}
+    end
+    return api
+end
+end)()
+
+local visual_profile = (function()
+-- Original game icon artwork/colors; exact stratagem payload to network type mapping.
+-- Unmapped variants deliberately omit the icon rather than borrow a wrong one.
+return {
+    pixel_height=24, icon_size=36, bar_width=64, bar_height=3,
+    near_scale=4.5, near_distance=8, reference_viewport_height=1600, min_pixel_height=22,
+    frame_scale=1.4, frame_alpha=90,
+    text_alpha=185, icon_alpha=145, bar_alpha=145,
+    max_distance=120, max_labels=32, head_offset=2.5,
+    font='core/performance_hud/debug',
+    font_material='mods/codex/sentry_ammo/font_depth',
+    icon_material='mods/codex/sentry_ammo/icons_depth',
+    icon_texture='mods/codex/sentry_ammo/icons_atlas',
+    bar_uv={u0=0.873046875,v0=0.873046875,u1=0.876953125,v1=0.876953125},
+    frame_uv={u0=0.00390625,v0=0.75390625,u1=0.24609375,v1=0.99609375},
+    icons={
+        ['9d474323']={u0=0.50390625,v0=0.50390625,u1=0.74609375,v1=0.74609375}, -- StratagemTurretLaserCannon
+        ['14c9c273']={u0=0.75390625,v0=0.50390625,u1=0.99609375,v1=0.74609375}, -- StratagemEmplacementsTeslatower
+        ['13a71430']={u0=0.50390625,v0=0.00390625,u1=0.74609375,v1=0.24609375}, -- StratagemTurretsMachinegun
+        ['2363e364']={u0=0.00390625,v0=0.25390625,u1=0.24609375,v1=0.49609375}, -- StratagemTurretsMortar
+        ['3416fff4']={u0=0.25390625,v0=0.25390625,u1=0.49609375,v1=0.49609375}, -- StratagemTurretsMortarStaticfield
+        ['3ae02f80']={u0=0.25390625,v0=0.50390625,u1=0.49609375,v1=0.74609375}, -- StratagemTurretFlamethrower
+        ['3bd04c18']={u0=0.25390625,v0=0.00390625,u1=0.49609375,v1=0.24609375}, -- StratagemEmplacementAntiTank
+        ['3c709c50']={u0=0.75390625,v0=0.00390625,u1=0.99609375,v1=0.24609375}, -- StratagemTurretsGatling
+        ['a37f0894']={u0=0.00390625,v0=0.50390625,u1=0.24609375,v1=0.74609375}, -- StratagemTurretsAutocannon
+        ['be95e875']={u0=0.75390625,v0=0.25390625,u1=0.99609375,v1=0.49609375}, -- StratagemTurretsRocket
+        ['bf35608c']={u0=0.00390625,v0=0.00390625,u1=0.24609375,v1=0.24609375}, -- StratagemMannedMachinegun
+        ['ec516bbd']={u0=0.50390625,v0=0.25390625,u1=0.74609375,v1=0.49609375}, -- StratagemTurretsGassentry
+    },
+}
+
+end)()
+
+local network,identity,census,camera_candidates,camera,camera_select,labels,snapshot
+local visual_settings
+local world=nil
+local tracked,records={},{}
+local now,sample_cursor,tracked_count=0,0,0
+local SAMPLE_INTERVAL=0.05
+local next_sample_time,last_heavy_frame,last_clock_time=nil,nil,nil
+local heavy_samples,last_sample_time=0,nil
+local cadence_reason='awaiting_clock'
+local last_status,last_signature,last_sample_log=-math.huge,nil,-math.huge
+local camera_reason,world_reason='not_sampled','no_world'
+local errors={}
+local function log(message,...)
+    if type(ot.log)=='function' then ot.log('SENTRY-AMMO '..message,...) end
+end
+local function finite(value)
+    return type(value)=='number' and value==value and value>-math.huge and value<math.huge
+end
+local function invoke(key,fn,...)
+    if type(fn)~='function' then return false,nil end
+    local ok,value=pcall(fn,...)
+    if not ok and not errors[key] then
+        errors[key]=true
+        log('%s failed: %s',key,tostring(value):gsub('[\r\n]',' '):sub(1,160))
+    end
+    return ok,value
+end
+local function current_world()
+    local ok,value=invoke('Application.main_world',App.main_world)
+    if not ok then world_reason='main_world_read_failed';return nil,false end
+    if value==nil then world_reason='no_main_world';return nil,true end
+    local listed,worlds=invoke('Application.worlds',App.worlds)
+    if not listed or type(worlds)~='table' then world_reason='world_list_read_failed';return nil,false end
+    if listed and type(worlds)=='table' then
+        for _,candidate in pairs(worlds) do
+            if candidate==value then world_reason='ready';return value,true end
+        end
+    end
+    world_reason='main_world_not_live'
+    return nil,true
+end
+local function forget(unit)
+    tracked[unit]=nil
+    if network then invoke('network.forget',network.forget,unit) end
+end
+local function reset(next_world)
+    world=next_world
+    tracked,records={},{}
+    sample_cursor,tracked_count=0,0
+    next_sample_time,last_sample_time=nil,nil
+    camera_reason='not_sampled'
+    cadence_reason=world and 'awaiting_sample' or 'no_world'
+    if network then invoke('network.reset',network.reset,world) end
+    if census then invoke('census.reset',census.reset,world) end
+    if snapshot then invoke('snapshot.reset',snapshot.reset,world) end
+    if camera_select then invoke('camera_select.reset',camera_select.reset) end
+    if labels then invoke('labels.reset',labels.reset,world) end
+end
+local function clear_snapshot(why)
+    records={}
+    if snapshot then invoke('snapshot.clear',snapshot.clear,why) end
+end
+local function refresh_clock()
+    local ok,value=invoke('ot.time',ot.time)
+    if not ok or not finite(value) then
+        cadence_reason='sample_clock_unavailable';clear_snapshot(cadence_reason);return false
+    end
+    now=value
+    if last_clock_time and now<last_clock_time then
+        last_clock_time=now;next_sample_time=nil
+        last_status,last_sample_log=-math.huge,-math.huge
+        cadence_reason='sample_clock_reversed';clear_snapshot(cadence_reason);return false
+    end
+    last_clock_time=now
+    return true
+end
+local function sample_ammo()
+    -- The complete candidate census, identity classification, and ammo reads run
+    -- at most 20 times per second. Rendering uses only the bounded snapshot.
+    local ok,targets=invoke('census.sample',census.sample)
+    if not ok or type(targets)~='table' then
+        -- An unreadable census is not evidence that all Unit lifetimes ended.
+        clear_snapshot('census_sample_failed');return false
+    end
+    local current,count={},0
+    for _,row in ipairs(targets) do
+        if type(row)~='table' or type(row.unit)~='userdata' or type(row.model_hash)~='string' then
+            clear_snapshot('census_sample_invalid');return false
+        end
+        if not current[row.unit] then count=count+1 end
+        current[row.unit]=row.model_hash
+    end
+    for unit in pairs(tracked) do if not current[unit] then forget(unit) end end
+    tracked,tracked_count=current,count
+    local updated,available=invoke('identity.update',identity.update,targets)
+    if #targets==0 then
+        clear_snapshot('snapshot_empty_source')
+        return true
+    end
+    -- Pending discovery can still return freshly validated established pairs.
+    -- network.sample always reads their current raw ammo again.
+    if not updated or available~=true then clear_snapshot('identity_sample_incomplete');return false end
+    local fresh={}
+    sample_cursor=sample_cursor%#targets
+    for i=1,#targets do
+        local target=targets[(sample_cursor+i-1)%#targets+1]
+        local sampled,record=invoke('network.sample',network.sample,target.unit,target.model_hash)
+        if sampled and type(record)=='table' and record.verified==true then fresh[#fresh+1]=record end
+    end
+    sample_cursor=(sample_cursor+1)%#targets
+    local captured,accepted=invoke('snapshot.capture',snapshot.capture,world,fresh)
+    if not captured or accepted~=true then clear_snapshot('snapshot_capture_failed');return false end
+    return true
+end
+local function status_of(module)
+    if not module then return {reason='module_unavailable'} end
+    local ok,value=invoke('module.status',module.status)
+    return ok and type(value)=='table' and value or {reason='status_unavailable'}
+end
+local function reason_of(module) return tostring(status_of(module).reason or 'unknown') end
+local function report()
+    local ns,ls,ids,cs,ss=status_of(network),status_of(labels),status_of(identity),status_of(census),status_of(snapshot)
+    local nr,lr,ir,cr=tostring(ns.reason),tostring(ls.reason),tostring(ids.reason),tostring(cs.reason)
+    local signature=table.concat({world_reason,tostring(tracked_count),tostring(#records),nr,ir,camera_reason,lr,cr,tostring(ss.reason),cadence_reason},'|')
+    if now-last_status>=15 or (signature~=last_signature and now-last_status>=1) then
+        log('tracked=%d records=%d network=%s identity=%s camera=%s labels=%s world=%s',
+            tracked_count,#records,nr,ir,camera_reason,lr,world_reason)
+        local sample_age=finite(ss.sample_time) and math.max(0,now-ss.sample_time) or nil
+        log('snapshot=%s age_ms=%s expires_at=%s sampled_frame=%s validation_frame=%s cadence=%s interval_ms=50 heavy_samples=%d last_sample_time=%s',
+            tostring(ss.reason),tostring(sample_age and sample_age*1000),tostring(ss.expires_at),
+            tostring(ss.sampled_frame),tostring(ss.validation_frame),cadence_reason,heavy_samples,tostring(last_sample_time))
+        log('draw submitted=%s icons=%s primitives=%s assets_ready=%s bar_reference=%s',
+            tostring(ls.submitted),tostring(ls.icons),tostring(ls.primitives),
+            tostring(ls.assets_ready),tostring(ls.bar_reference))
+        log('census=%s complete=%s queries=%s units_checked=%s candidates=%s elapsed_ms=%s',
+            cr,tostring(cs.complete),tostring(cs.queries),tostring(cs.units_checked),tostring(cs.targets),tostring(cs.elapsed_ms))
+        if tracked_count>0 then
+            log('identity discovery_complete=%s discovery_reason=%s retained=%s admitted=%s',
+                tostring(ids.discovery_complete),tostring(ids.discovery_reason),
+                tostring(ids.retained_bindings),tostring(ids.new_bindings))
+            log('identity objects=%s pending=%s expired=%s candidates=%s bound=%s nearest_metres=%s nearest_type=%s',
+                tostring(ids.objects),tostring(ids.unclassified),tostring(ids.expired_negatives),
+                tostring(ids.candidates),tostring(ids.bound),tostring(ids.minimum_same_model_distance),tostring(ids.nearest_type_hash))
+            log('identity progress checks_per_second=%s estimated_sweep_seconds=%s cache_seconds=%s oldest_negative_seconds=%s throughput_limited=%s',
+                tostring(ids.classification_checks_per_second),tostring(ids.estimated_negative_sweep_seconds),
+                tostring(ids.negative_cache_max_age),tostring(ids.oldest_negative_age),tostring(ids.classification_throughput_limited))
+            local up,np=ids.nearest_unit_position,ids.nearest_network_vector
+            if type(up)=='table' and type(np)=='table' then
+                log('identity closest sample frame=%s unit=(%.5f,%.5f,%.5f) network=(%.5f,%.5f,%.5f)',
+                    tostring(ids.distance_sample_frame),up.x,up.y,up.z,np.x,np.y,np.z)
+            end
+        end
+        last_status,last_signature=now,signature
+    end
+    if #records>0 and now-last_sample_log>=2 then
+        local samples={}
+        for i=1,math.min(#records,8) do
+            local r=records[i]
+            local extra=r.auxiliary or {}
+            local metric
+            if r.metric_kind=='heat' then
+                metric=string.format('heat=%s estimated_threshold=%s max_verified=%s',
+                    tostring(r.metric_value),tostring(r.metric_max),tostring(r.metric_max_verified))
+            elseif r.metric_kind=='lifetime' then
+                metric=string.format('estimated_seconds=%s estimate_basis=%s',
+                    tostring(r.metric_value),tostring(r.metric_estimate_basis))
+            else metric='rounds='..tostring(r.rounds) end
+            samples[#samples+1]=string.format('object=%s type=%s %s magazines=%s chamber_empty=%s aux_frame=%s identity=%s',
+                tostring(r.network_goid),tostring(r.network_type),metric,
+                tostring(extra.magazines_remaining),tostring(extra.chamber_empty),
+                tostring(r.auxiliary_sample_frame),tostring(r.identity_basis))
+        end
+        log('live samples: %s',table.concat(samples,'; '))
+        last_sample_log=now
+    end
+end
+local ready=type(create_network)=='function' and type(create_identity)=='function'
+    and type(create_census)=='function' and type(create_camera_units)=='function'
+    and type(create_camera)=='function' and type(create_camera_select)=='function'
+    and type(create_labels)=='function' and type(create_snapshot)=='function'
+    and type(network_profile)=='table' and type(visual_profile)=='table'
+    and type(ot.time)=='function' and type(ot.frame)=='function'
+    and type(App.main_world)=='function' and type(App.worlds)=='function'
+    and type(Unit.alive)=='function' and type(Unit.world)=='function'
+if ready then
+    identity=create_identity(ot,network_profile)
+    network=create_network(ot,network_profile,identity)
+    census=create_census(ot,network_profile)
+    snapshot=create_snapshot(ot,network_profile)
+    camera_candidates=create_camera_units(ot)
+    camera=create_camera(ot)
+    camera_select=create_camera_select(ot)
+    labels=create_labels(ot,visual_profile)
+    local settings_ok,value=invoke('settings.create',create_visual_settings,ot,labels,visual_profile)
+    if settings_ok then visual_settings=value end
+end
+log('version=%s ready=%s; 20 Hz complete sampling, bounded 80 ms snapshots; game validation pending',VERSION,tostring(ready))
+return {
+    version=VERSION,
+    update=function(dt)
+        if visual_settings then invoke('settings.update',visual_settings.update,dt) end
+        if not ready then return end
+        -- Use the provider/snapshot clock. dt accumulation would drift away
+        -- from the samples' real timestamps and could extend their lifetime.
+        local clock_ready=refresh_clock()
+        local latest,world_known=current_world()
+        if world_known and latest~=world then reset(latest) end
+        if not world_known then clear_snapshot('world_context_unavailable') end
+        if not clock_ready or not world_known or not world then return end
+        local fok,frame=invoke('ot.frame',ot.frame)
+        if not fok or not finite(frame) or frame<0 or frame%1~=0 then
+            cadence_reason='sample_frame_unavailable';clear_snapshot(cadence_reason);return
+        end
+        if frame==last_heavy_frame then return end
+        if next_sample_time==nil then next_sample_time=now end
+        if now+1e-9<next_sample_time then return end
+        -- Skip missed slots after a long frame; never run a catch-up loop.
+        local skipped=math.floor(math.max(0,now-next_sample_time)/SAMPLE_INTERVAL+1e-8)
+        next_sample_time=next_sample_time+(skipped+1)*SAMPLE_INTERVAL
+        last_heavy_frame,last_sample_time=frame,now
+        heavy_samples=heavy_samples+1
+        cadence_reason=sample_ammo() and 'sampled_20hz' or 'sample_failed'
+    end,
+    render=function()
+        if not ready then return end
+        local clock_ready=refresh_clock()
+        local latest,world_known=current_world()
+        if world_known and latest~=world then reset(latest) end
+        if not world_known then clear_snapshot('world_context_unavailable') end
+        local view=nil
+        records={}
+        if world and world_known and clock_ready then
+            local valid,current=invoke('snapshot.snapshot',snapshot.snapshot,world)
+            if valid and type(current)=='table' then records=current
+            else clear_snapshot('snapshot_validation_failed') end
+        end
+        if world and world_known then
+            local listed,units=invoke('camera_units.sample',camera_candidates.sample,world)
+            if listed and type(units)=='table' then
+                local selected,active=invoke('camera_select.select',camera_select.select,world,units)
+                if selected and active then
+                    local sampled,result=invoke('camera.sample',camera.sample,world,active)
+                    if sampled then view=result end
+                    camera_reason=reason_of(camera)
+                else camera_reason=reason_of(camera_select) end
+            else camera_reason=reason_of(camera_candidates) end
+        else camera_reason=world_known and 'no_world' or 'world_context_unavailable' end
+        invoke('labels.update',labels.update,view,records)
+        report()
+    end,
+    shutdown=function()
+        if visual_settings then invoke('settings.shutdown',visual_settings.shutdown) end
+        records,tracked={},{}
+        tracked_count=0
+        if labels then invoke('labels.shutdown',labels.shutdown) end
+        if snapshot then invoke('snapshot.shutdown',snapshot.shutdown) end
+        if camera_select then invoke('camera_select.reset',camera_select.reset) end
+        if census then invoke('census.shutdown',census.shutdown) end
+        if network then invoke('network.shutdown',network.shutdown) end
+        world=nil
+        ready=false
+    end,
+}
