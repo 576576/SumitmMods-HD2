@@ -1,0 +1,41 @@
+{
+  "Version": 1,
+  "Guid": "7596f211-b832-47c0-86bd-7ae31e92fe80",
+  "Name": "RS-422 Railgun Ultra 1.0.0",
+  "IconPath": "thumbnail.png",
+  "Description": "把 RS-422 Railgun 的命中爆炸换成轨道打击：精准、毒气、轨道炮、电磁四种，每次只勾一个。离线改写密封数据表，不加载 FFI、不读内存、不依赖加载器；首次启动写入，重启游戏后生效。 / Retargets the RS-422 Railgun's impact explosion to an orbital strike; four options, tick one. Rewrites the sealed data table offline — no FFI, no memory access, no loader; applied on first launch, effective after a restart.",
+  "Options": [
+    {
+      "Name": "轨道精准 / Orbital Precision Strike",
+      "Description": "命中爆炸改为轨道精准。单发高爆，落点集中。四个选项只勾一个。",
+      "Image": "images/precision.png",
+      "Include": [
+        "options/precision"
+      ]
+    },
+    {
+      "Name": "轨道毒气 / Orbital Gas Strike",
+      "Description": "命中爆炸改为轨道毒气。命中点留下持续毒雾。四个选项只勾一个。",
+      "Image": "images/gas.png",
+      "Include": [
+        "options/gas"
+      ]
+    },
+    {
+      "Name": "轨道炮 / Orbital Railcannon Strike",
+      "Description": "命中爆炸改为轨道炮。单体高伤的贯穿爆炸。四个选项只勾一个。",
+      "Image": "images/railcannon.png",
+      "Include": [
+        "options/railcannon"
+      ]
+    },
+    {
+      "Name": "轨道电磁 / Orbital EMS Strike",
+      "Description": "命中爆炸改为轨道电磁。命中点形成减速电磁场，伤害很低。四个选项只勾一个。",
+      "Image": "images/ems.png",
+      "Include": [
+        "options/ems"
+      ]
+    }
+  ]
+}
