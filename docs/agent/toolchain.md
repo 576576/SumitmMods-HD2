@@ -5,7 +5,8 @@
 
 **这份文档是给 agent 看的工作说明**：改哪个文件、跑什么命令、哪些结论已经踩实。
 容器格式细节、命令逐条解释、重建流程与验证清单在 [unpacking.md](unpacking.md)；
-共享库（unit 解析 / 补丁重建 / 渲染器）在 [libs.md](libs.md)；发版脚本在 [release.md](release.md)。
+共享库（unit 解析 / 补丁重建 / 渲染器）在 [libs.md](libs.md)；发版脚本在 [release.md](release.md)；
+运行时网络对象与 unit 的对应（类型/字段哈希、崩溃红线、诊断日志）在 [network-identity.md](network-identity.md)。
 
 ## 目录
 
@@ -24,7 +25,7 @@ toolchain/
 │  └─ filediver-cli.exe     本机 Go 编译的 Filediver CLI
 ├─ rawdump.exe              本机 Go 编译，导出原始资源字节
 ├─ unitcheck.exe            本机 Go 编译，校验 unit main + GPU
-├─ release.py               三个 mod 的升版 / 构建 / 校验入口
+├─ release.py               四个 mod 的升版 / 构建 / 校验入口
 └─ out/                     运行产物：索引、诊断、提取结果（不入库）
 ```
 
@@ -90,6 +91,9 @@ python tools/update_hashes.py
 - 四种地雷的 unit hash 已反查为 `contact_mine` / `gas_mine` / `incendiary_mine` / `tank_mine`；据此发现早期版本 `Mines-Highlight` 的四个选项标签全部错位（重刷版已修正）。
 - Filediver 已从当前 build 成功导出 `contact_mine.unit.glb`（3.8 MB），"重新解包再重做"的路径可用。
 - EAC 是否放行带 GPU 资源的 patch 仍需游戏内实测。详见 [unpacking.md](unpacking.md) 的「结论先行」与「已知限制」。
+
+以上都是**磁盘侧**（容器、资源、patch 头）的结论，绑定到本机 build。运行时读字段、
+认网络对象那部分不在这里，见 [network-identity.md](network-identity.md)。
 
 ## 产物
 

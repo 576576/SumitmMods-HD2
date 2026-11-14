@@ -28,6 +28,7 @@ docs/agent/   给开发 / agent 看的说明
 python toolchain/release.py list
 python toolchain/release.py build mines
 python toolchain/release.py build sentry
+python toolchain/release.py build armor
 python toolchain/release.py build rs422
 ```
 
@@ -38,7 +39,7 @@ python toolchain/release.py build rs422
 ## 文档
 
 - 各 mod 的玩法与安装：`mods/<Mod>/README.md`
-- 开发与工具链：[`docs/agent/`](docs/agent/README.md) —— 工具链总览、解包指南、共享库、发版流程
+- 开发与工具链：[`docs/agent/`](docs/agent/README.md) —— 工具链总览、解包指南、网络对象与 unit 的对应、共享库、发版流程
 
 构建只依赖 Python 标准库与 Pillow；素材重建（模型渲染、战备图标导出）额外需要
 `toolchain/` 下的三个 exe 和游戏目录，用法见 [`docs/agent/toolchain.md`](docs/agent/toolchain.md)。

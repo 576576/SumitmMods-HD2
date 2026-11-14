@@ -1,10 +1,11 @@
 # 发版脚本（`toolchain/release.py`）
 
-三个 mod 的升版、构建、校验都走这一个入口。产物统一落在仓库根 `dist/`（不入库）。
+四个 mod 的升版、构建、校验都走这一个入口。产物统一落在仓库根 `dist/`（不入库）。
 
 ```bash
 python toolchain/release.py list                     # 版本、产物、SHA256、清单显示名
 python toolchain/release.py build mines              # 重建 + 报告
+python toolchain/release.py build armor              # 护甲多被动（内含 tools/build_patch.py）
 python toolchain/release.py build rs422 --full       # 连预处理一起跑（重烘字节补丁表，约 3 分钟）
 python toolchain/release.py bump sentry patch        # 只升号
 python toolchain/release.py bump mines 1.0.2 --build # 升到指定版本并重建

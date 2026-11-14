@@ -18,6 +18,7 @@ docs/agent/  这份文档
 |---|---|---|
 | `mods/Mines-Highlight` | 地雷高亮（9 个选项：4 种地雷 + 3 种战备雷 + 机器人/虫雷） | `python toolchain/release.py build mines` |
 | `mods/Sentry-Ammo-Display` | 炮塔与阵地显示弹药条、2D 战备图标 | `python toolchain/release.py build sentry` |
+| `mods/Armor-Multi-Passive` | 护甲多被动（MDL3 版，自选 32 项额外被动） | `python toolchain/release.py build armor` |
 | `mods/RS-422-Railgun-Ultra` | RS-422 磁轨炮命中爆炸换成四种轨道打击 | `python toolchain/release.py build rs422` |
 
 ## 文档
@@ -26,6 +27,7 @@ docs/agent/  这份文档
 |---|---|
 | [toolchain.md](toolchain.md) | 工具链总览：hd2tool 命令、三个 exe、名表更新、实测结论 |
 | [unpacking.md](unpacking.md) | 解包指南：DSAR / Stingray bundle 格式、patch 重建、验证清单、已知限制 |
+| [network-identity.md](network-identity.md) | 运行时网络对象与 unit 的对应：类型/字段哈希、位置容差四档、诊断日志、崩溃红线 |
 | [libs.md](libs.md) | `toolchain/common/` 四个共享库的职责与约定 |
 | [release.md](release.md) | `release.py` 的项目表、不变式、加新 mod 的步骤 |
 
@@ -42,6 +44,10 @@ docs/agent/  这份文档
 
 - **不许猜资源**：位置、hash、图标、字段含义都要有来源（游戏文件反查、骨骼矩阵、名表、本地化
   文本）。找不到就去找来源，不要用「看起来差不多」的资源顶上。
+- **运行时只读 schema 声明的字段**。`game_object_field` 读未声明的字段不是安全失败，
+  是直接崩进程；对象越密集越容易踩到（舰桥）。详见 [network-identity.md](network-identity.md)。
+- **一处错不能让全局失效**。单条记录、单个类型出错只丢自己：快照采集逐条容错，
+  schema 校验失败只停用该类型。这一条已经复发三次，每次都是「所有型号一起没条」。
 - **改 unit / patch 之后必须跑校验**，`verify_unit()` 与 `test_packages.py` 是底线；
   「游戏能启动」不算通过。
 - **注释只写「是什么」和「不这么做会怎么错」**，不写决策过程、试错史、issue 编号。
