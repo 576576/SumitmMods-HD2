@@ -11,7 +11,7 @@ from hd2tool import idstring64  # noqa: E402
 from net_type_scan import SCAN as PROBE  # noqa: E402
 SOURCE = ROOT / "tools" / "source" / "e02b68d623c30acd.orig.lua"
 CORE = ROOT / "core" / "e02b68d623c30acd.lua"
-SLOT = 224_000          # 归档里这一行的总长度，与 patch_archive.GROW[CORE_ID] 同源
+SLOT = 260_000          # 归档里这一行的总长度，与 patch_archive.GROW[CORE_ID] 同源
 SOURCE_LIMIT = SLOT - 8
 
 OT = r'''local ot=(function()
@@ -129,6 +129,13 @@ WIDE = (
 )
 
 
+# 只进 census 白名单、不建绑定的模型：用来确认某个 unit 到底在不在场上。
+# 补给车车体的网络类型没有位置字段也没有 rounds_remaining，绑定等字段确认后再加。
+CENSUS_EXTRA = (
+    ("9b2140378640432e",
+     "content/fac_helldivers/vehicles/frv_supply/frv_supply"),
+)
+
 GROUPS = r'''
 local GROUPS={
     ammo={'37cde43876ba26bb','61d9dda22a59e9bc','cbfe1fc7158347f3','37079568dc86e9c6','820cc3bafe962858'},
@@ -220,6 +227,50 @@ do
 
 ALIAS_TAIL = "end\n"
 
+# 榴弹兵墙挂的榴弹发射器、武装补给舱的枪：两条网络类型在 network_config 里存在，
+# 但上游清单没收录。名字由 32 位 hash 碰撞生成（引擎只比 murmur64 高 32 位）。
+# 前者的 schema 整条没有 `c{i(uTh>`，binding 不带位置字段，由身份模块按「场上唯一对象」认领。
+LATE_TYPES = (
+    ("17db8107", "!!!H[UA2", 24, None,
+     ("50ac6619", "8bbeb160", "20605662", "2d27198c", "98b4aaf0", "c336a25c", "3132608f",
+      "67526982", "31182caf", "49c250a6", "31f86165", "09d8bef4", "c20428c6", "6d1d5cfb",
+      "788b9753", "99901914", "1dd07f05", "39d141d6", "c3a3f66c", "6f3ab277", "4cbcc2a2",
+      "7030c54e", "ec64918b", "d7a5d63e", "4a893e74", "cd889dbc")),
+    ("4e64c4dc", "!!!:^yT5", 31, 3,
+     ("50ac6619", "98b4aaf0", "9a9b14c4", "c336a25c", "3ccffa7f", "d22b948c", "c20428c6",
+      "6d1d5cfb", "a4c332a8", "9bbb856e", "b897e2d8", "a1659a75", "d5a66654", "d7082cbf",
+      "ac08fe53", "7a4bdbbe", "5dd8181b", "b6347304", "078c5d3b", "60e13e87", "e0a79052",
+      "9611c029", "cc0b45e5", "9d5d6cc7", "49c250a6", "31f86165", "09d8bef4", "3132608f",
+      "95c46304", "ec64918b", "d7a5d63e", "4a893e74", "67526982", "31182caf", "6f3ab277",
+      "4cbcc2a2", "7030c54e")),
+)
+
+LATE_BINDINGS = (
+    ("2eecd0b1fa49630", "17db8107"),
+    ("73681ffd58fa1a90", "4e64c4dc"),
+)
+
+
+def late_block():
+    var = {}
+    lines = ["    local function late_type(hash,call,rounds_slot,fields)\n",
+             "        P.types[#P.types+1]={type_hash=hash,call=call,rounds_slot=rounds_slot,fields=fields}\n",
+             "        return P.types[#P.types]\n    end\n"]
+    for hash_, call, rounds, pos, fields in LATE_TYPES:
+        name = "t_" + hash_
+        lines.append("    local %s=late_type('%s','%s',%d,{%s})\n"
+                     % (name, hash_, call, rounds, ",".join("'%s'" % f for f in fields)))
+        var[hash_] = name
+    by_hash = {h: (p, c, f) for h, c, r, p, f in LATE_TYPES}
+    for model, hash_ in LATE_BINDINGS:
+        pos_slot = by_hash[hash_][0]
+        body = "type_hash=%s.type_hash,call=%s.call,fields=%s.fields" % (var[hash_], var[hash_], var[hash_])
+        if pos_slot:
+            body += (",position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=%d"
+                     % pos_slot)
+        lines.append("    P.bindings[#P.bindings+1]={model_hash='%s',%s}\n" % (model, body))
+    return "".join(lines)
+
 
 def alias_block():
     lines = [ALIAS_HEAD]
@@ -227,6 +278,10 @@ def alias_block():
         lines.append("    alias('%s', '%s', '%s')\n" % (base, new, path))
     for new, path in WIDE:
         lines.append("    bind_all('%s', '%s')\n" % (new, path))
+    for new, path in CENSUS_EXTRA:
+        lines.append("    P.models['%s']=true\n" % new)
+        lines.append("    P.model_resources['%s']='%s'\n" % (new, path))
+    lines.append(late_block())
     lines.append(ALIAS_TAIL)
     return "".join(lines)
 
@@ -259,6 +314,10 @@ def check_profile_links(text):
     一条不中整表判 invalid_static_bindings，表现为所有炮塔都不显示。
     """
     keys = {norm_hash(k) for k in profile_models(text)}
+    # WIDE / ALIASES / LATE_BINDINGS 的模型是在运行时写进 models 的，不在字面量里。
+    keys |= {norm_hash(m) for m, _ in WIDE}
+    keys |= {norm_hash(n) for _, n, _ in ALIASES}
+    keys |= {norm_hash(m) for m, _ in LATE_BINDINGS}
     bad = sorted({m for m in BINDING_ID_RE.findall(text) if norm_hash(m) not in keys})
     if bad:
         raise SystemExit("binding 的 model_hash 不在 models 清单里：%s" % ", ".join(bad))
@@ -267,7 +326,7 @@ def check_profile_links(text):
 
 def check_wide_paths():
     """WIDE 里的 id 必须是那条 unit 路径的哈希，资源查询按名字找，对不上就什么都查不到。"""
-    bad = ["%s <- %s" % (model, path) for model, path in WIDE
+    bad = ["%s <- %s" % (model, path) for model, path in WIDE + CENSUS_EXTRA
            if norm_hash(model) != norm_hash("%016x" % idstring64(path))]
     if bad:
         raise SystemExit("WIDE 的模型 id 与路径哈希不符：%s" % ", ".join(bad))
@@ -279,7 +338,7 @@ def check_id_forms():
     models 的键与 binding 的 model_hash 都按这个形态写，运行时再 gsub('^0+','')
     归一化后查表；数据里带零虽然跑得起来，但对不上 profile 原有的键，排查成本很高。
     """
-    bad = [model for model, _ in WIDE if model != norm_hash(model)]
+    bad = [model for model, _ in WIDE + CENSUS_EXTRA if model != norm_hash(model)]
     bad += [new for _, new, _ in ALIASES if new != norm_hash(new)]
     if bad:
         raise SystemExit("模型 id 必须去掉前导零：%s" % ", ".join(bad))
@@ -312,7 +371,7 @@ def main():
         raise SystemExit("census 上限那行不是预期形态，清单结构可能已变")
     text = text.replace(CENSUS_LIMIT_OLD, CENSUS_LIMIT_NEW, 1)
 
-    total = len(profile_models(text)) + len(ALIASES) + len(WIDE)
+    total = len(profile_models(text)) + len(ALIASES) + len(WIDE) + len(CENSUS_EXTRA)
     if total > CENSUS_LIMIT:
         raise SystemExit("模型数 %d 超过 census 上限 %d" % (total, CENSUS_LIMIT))
     print("census models:", total, "limit:", CENSUS_LIMIT)
@@ -373,7 +432,7 @@ def main():
         raise SystemExit("还是超长：%d > %d" % (size, SOURCE_LIMIT))
     text += "\n" * (SOURCE_LIMIT - size)
     CORE.write_text(text, encoding="utf-8", newline="")  # 保持 LF，长度必须逐字节对齐槽位
-    print("core source: %d bytes, slot %d" % (SOURCE_LIMIT, SLOT))
+    print("core source: %d bytes, slot %d, headroom %d" % (size, SLOT, SOURCE_LIMIT - size))
 
 
 if __name__ == "__main__":

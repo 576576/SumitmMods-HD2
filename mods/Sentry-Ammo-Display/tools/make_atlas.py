@@ -44,7 +44,8 @@ SS = 4                # 绘制时超采样倍数，缩小必须用 BOX，LANCZOS
 # (列, 行, 图标名)；与 core/e02b68d623c30acd.lua 的 visual_profile.icons 一一对应。
 CELLS = (
     (0, 0, "defensive_turrets_manned_machinegun"),
-    (1, 0, "defensive_turrets_manned_grenade"),
+    # 榴弹兵防卫墙没有纹理版图标，用 make_icons.py 从 xaml 光栅化的那张。
+    (1, 0, "wall"),
     (2, 0, "defensive_turrets_machinegun"),
     (3, 0, "defensive_turrets_gatling"),
     (0, 1, "defensive_turrets_mortar"),

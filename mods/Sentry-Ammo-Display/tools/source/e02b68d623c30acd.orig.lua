@@ -763,10 +763,13 @@ return function(ot,profile)
     local App,Unit,V3,Net,GS=S.Application or {},S.Unit or {},S.Vector3 or {},S.Network or {},S.GameSession or {}
     local MAX_CHECKS,SECONDS,MAX_POSITIVES=256,0.0005,128
     local RECHECK_INTERVAL,BASE_AGE,MAX_AGE,EPS2=10,12,120,0.001^2
+    -- 结构类单位（补给舱、载具）的 unit 原点与网络对象坐标不重合，精确到毫米会全部落空。
+    local NEAR2=2.0^2
     local world,session,rows,schemas=nil,nil,{},{}
     local pending,refresh,ph,rh={},{},1,1
     local resolved,resolved_frame={},nil
     local established,retired_units={},{}
+    local unresolved_log_time=nil
     local discovery_complete,discovery_reason,retained_count,new_count=false,'awaiting_discovery',0,0
     local validation_time,validation_frame=nil,nil
     local reason,problem='no_world',nil
@@ -829,10 +832,13 @@ return function(ot,profile)
         for index,b in ipairs(bindings) do
             local mh=type(b)=='table' and hex(b.model_hash,16,false)
             local th=type(b)=='table' and hex(b.type_hash,8,true)
+            -- 位置字段可以整条缺省：这类 schema 里根本没有 c{i(uTh>，只能靠唯一对象认领。
+            local has_position=b.position_field~=nil or b.position_slot~=nil
             if not mh or not th or type(b.call)~='string' or #b.call<1 or #b.call>128
-                or type(b.position_field)~='string' or #b.position_field<1 or #b.position_field>128
                 or type(b.fields)~='table' or #b.fields<1 or #b.fields>512
-                or not integer(b.position_slot,1,#b.fields) then
+                or (has_position and (type(b.position_field)~='string'
+                    or #b.position_field<1 or #b.position_field>128
+                    or not integer(b.position_slot,1,#b.fields))) then
                 problem='invalid_static_bindings'
                 problem_detail=string.format('bindings[%d] model=%s type=%s',index,tostring(mh),tostring(th))
                 break
@@ -841,9 +847,12 @@ return function(ot,profile)
             for i=1,#b.fields do fields[i]=hex(b.fields[i],8,true) end
             local fields_valid=true
             for i=1,#b.fields do if not fields[i] then fields_valid=false end end
-            local position_hash=hex(b.position_field_hash,8,true)
-            if not fields_valid or not position_hash or fields[b.position_slot]~=position_hash then
-                problem='invalid_static_fields';break
+            if not fields_valid then problem='invalid_static_fields';break end
+            if has_position then
+                local position_hash=hex(b.position_field_hash,8,true)
+                if not position_hash or fields[b.position_slot]~=position_hash then
+                    problem='invalid_static_fields';break
+                end
             end
             local t=by_type[th]
             if t then
@@ -904,7 +913,7 @@ return function(ot,profile)
         for id in pairs(rows) do if not ids[id] then rows[id]=nil end end
         for id in pairs(ids) do
             local row=rows[id]
-            if not row then row={id=id,next_type=1};rows[id]=row;enqueue(row,'pending')
+            if not row then row={id=id,next_type=1,seen_at=now};rows[id]=row;enqueue(row,'pending')
             end
         end
     end
@@ -1033,6 +1042,10 @@ return function(ot,profile)
     local function schema(t)
         local saved=schemas[t.type_hash]
         if saved~=nil then return saved.valid,saved.reason end
+        if not integer(t.position_slot,1,#t.fields) then
+            schemas[t.type_hash]={valid=false,reason='no_position_field'}
+            return false,'no_position_field'
+        end
         local function detail(value) return tostring(value):gsub('[\r\n]',' '):sub(1,64) end
         local function bad(code)
             schemas[t.type_hash]={valid=false,reason=code}
@@ -1212,16 +1225,22 @@ return function(ot,profile)
         end
         -- A successful check must still refer to the same observed object row.
         -- Never replace an established pair with a new GOID or recycled row.
+        -- 对象消失后这台单位不再认旧对象，但之后新部署的对象仍可认领。
+        -- 战备会复用单位句柄，只按单位永久封禁会让重新部署的那一台永远不显示。
         for unit,p in pairs(established) do
             local row=rows[p.goid]
             if not row or row~=p.object_row or not row.kind or row.kind.type_hash~=p.type_hash
                 or unit_by[unit].model_hash~=p.model_hash then
-                established[unit]=nil;retired_units[unit]=true
+                established[unit]=nil;retired_units[unit]=now
             end
         end
         local candidates,candidate_by={},{}
         for id,row in pairs(rows) do
-            if row.kind and row.checked_frame==frame then
+            -- 没有位置字段的类型不参与向量匹配，也不算缺失候选，否则 discovery 永远完不成。
+            local trackable=row.kind and integer(row.kind.position_slot,1,#row.kind.fields)
+            if not trackable then
+                -- 交给下面「唯一对象」那一层处理。
+            elseif row.checked_frame==frame then
                 local valid,schema_reason=schema(row.kind)
                 if not valid then candidate_problem=candidate_problem or (schema_reason..':'..row.kind.type_hash)
                 else
@@ -1257,16 +1276,112 @@ return function(ot,profile)
                 end
             end
         end
-        -- 认不出来的模型打一次：最近的网络对象是什么类型、有多远。
+        -- 结构类的 unit 原点与网络对象坐标并不重合，两米内再给一次机会；
+        -- 只有「一个单位对一个对象」互相唯一时才认，避免把邻近的另一台设备抢过来。
+        local near_choice,near_units,near_ids={},{},{}
+        for _,u in ipairs(units) do
+            if not choice[u.unit] then
+                for _,c in ipairs(candidates) do
+                    if c.kind.models[u.model_hash] and not id_count[c.id] then
+                        local distance2=(u.x-c.x)^2+(u.y-c.y)^2+(u.z-c.z)^2
+                        if distance2>EPS2 and distance2<=NEAR2 then
+                            near_units[u.unit]=(near_units[u.unit] or 0)+1
+                            near_ids[c.id]=(near_ids[c.id] or 0)+1
+                            near_choice[u.unit]=c
+                        end
+                    end
+                end
+            end
+        end
+        for unit,c in pairs(near_choice) do
+            if near_units[unit]==1 and near_ids[c.id]==1 and not id_count[c.id] then
+                unit_count[unit],id_count[c.id],choice[unit]=1,1,c
+            end
+        end
+        -- 没有位置字段的类型进不了候选。已配对的单位先锁住自己那个对象，
+        -- 剩下没被占用的同类型对象唯一时才认领；否则第二台部署后两边都不唯一，
+        -- 整组一起失效。
+        local pinned,taken={},{}
+        for _,u in ipairs(units) do
+            local p=established[u.unit]
+            local row=p and rows[p.goid]
+            if row and row.kind and row==p.object_row and row.kind.models[u.model_hash]
+                and not integer(row.kind.position_slot,1,#row.kind.fields) then
+                pinned[u.unit]=row;taken[row.id]=true
+            end
+        end
+        local type_total,type_only={},{}
+        for id,row in pairs(rows) do
+            if row.kind and not taken[id] then
+                local t=row.kind.type_hash
+                type_total[t]=(type_total[t] or 0)+1;type_only[t]=row
+            end
+        end
+        for _,u in ipairs(units) do
+            if not choice[u.unit] then
+                local pick=pinned[u.unit]
+                if not pick then
+                    for _,row in pairs(type_only) do
+                        if type_total[row.kind.type_hash]==1 and row.kind.models[u.model_hash]
+                            and not integer(row.kind.position_slot,1,#row.kind.fields)
+                            and not id_count[row.id] then
+                            if pick then pick=false;break end
+                            pick=row
+                        end
+                    end
+                end
+                if pick then
+                    local c={id=pick.id,kind=pick.kind,object_row=pick,x=u.x,y=u.y,z=u.z}
+                    candidates[#candidates+1]=c;candidate_by[c.id]=c
+                    unit_count[u.unit],id_count[c.id],choice[u.unit]=1,1,c
+                end
+            end
+        end
+        -- 同一帧落下多台时上一步没有唯一对象可认：未认领的单位数与未占用的对象数
+        -- 相等就按 goid 顺序配对。同型号、同初始弹药，配错只影响相邻两台。
+        do
+            local open_by_model={}
+            for _,u in ipairs(units) do
+                if not choice[u.unit] then
+                    local list=open_by_model[u.model_hash]
+                    if not list then list={};open_by_model[u.model_hash]=list end
+                    list[#list+1]=u
+                end
+            end
+            local free={}
+            for id,row in pairs(rows) do
+                if row.kind and not taken[id] and not id_count[id]
+                    and not integer(row.kind.position_slot,1,#row.kind.fields) then
+                    free[#free+1]=row
+                end
+            end
+            table.sort(free,function(a,b) return a.id<b.id end)
+            for model,list in pairs(open_by_model) do
+                local pool={}
+                for i=1,#free do
+                    if free[i].kind.models[model] then pool[#pool+1]=free[i] end
+                end
+                if #pool>1 and #pool==#list then
+                    for i=1,#list do
+                        local u,row=list[i],pool[i]
+                        local c={id=row.id,kind=row.kind,object_row=row,x=u.x,y=u.y,z=u.z}
+                        candidates[#candidates+1]=c;candidate_by[c.id]=c
+                        unit_count[u.unit],id_count[c.id],choice[u.unit]=1,1,c
+                    end
+                end
+            end
+        end
+        -- 认不出来的模型每 60 秒重打一次：最近的网络对象是什么类型、有多远。
         if type(ot.log)=='function' then
             for _,u in ipairs(units) do
-                if not choice[u.unit] and not diag_logged[u.model_hash] then
+                local last=diag_logged[u.model_hash]
+                if not choice[u.unit] and (not last or now-last>=60) then
                     local best,best2=nil,nil
                     for _,c in ipairs(candidates) do
                         local distance2=(u.x-c.x)^2+(u.y-c.y)^2+(u.z-c.z)^2
                         if not best2 or distance2<best2 then best,best2=c,distance2 end
                     end
-                    diag_logged[u.model_hash]=true
+                    diag_logged[u.model_hash]=now
                     if best then
                         pcall(ot.log,'SENTRY-IDENTITY unbound model=%s nearest_type=%s distance=%.2f',
                             u.model_hash,best.kind.type_hash,math.sqrt(best2))
@@ -1276,6 +1391,8 @@ return function(ot,profile)
                 end
             end
         end
+        -- 每 15 秒说明还有谁没认出来，附上卡在哪一步。
+        local blocked=nil
         for _,u in ipairs(units) do
             local p=established[u.unit]
             local c=p and candidate_by[p.goid] or choice[u.unit]
@@ -1283,7 +1400,10 @@ return function(ot,profile)
             local original=same and choice[u.unit]==c
             local unique=c and unit_count[u.unit]==1 and id_count[c.id]==1
             local retained=p and original and unique
-            local admit=not p and not retired_units[u.unit] and discovery_complete and unique
+            local retired_at=retired_units[u.unit]
+            local fresh=retired_at and c and c.object_row and c.object_row.seen_at
+                and c.object_row.seen_at>=retired_at
+            local admit=not p and (not retired_at or fresh) and discovery_complete and unique
             if retained or admit then
                 if admit then
                     p={goid=c.id,type_hash=c.kind.type_hash,model_hash=u.model_hash,
@@ -1294,7 +1414,17 @@ return function(ot,profile)
                     frame=frame,model_hash=u.model_hash,identity_basis='static_type_and_unique_vector_match',
                     identity_retained=retained==true,identity_established_frame=p.established_frame}
                 bound=bound+1
+            else
+                blocked=blocked or {}
+                blocked[#blocked+1]=u.model_hash..':'..(not c and 'no_match'
+                    or (retired_at and not fresh and 'retired')
+                    or (not unique and 'not_unique')
+                    or (not discovery_complete and 'discovery') or 'other')
             end
+        end
+        if blocked and type(ot.log)=='function' and now-(unresolved_log_time or -1e9)>=15 then
+            unresolved_log_time=now
+            pcall(ot.log,'SENTRY-IDENTITY unresolved %d: %s',#blocked,table.concat(blocked,' '))
         end
         resolved_frame=frame
         if bound>0 then
@@ -1505,9 +1635,9 @@ return function(ot,profile)
                     local allowed,why=measure();if not allowed then return fail(why) end
                 end
             end
-            if type(ot.log)=='function' and not census_logged[resource.path] then
-                census_logged[resource.path]=true
-                pcall(ot.log,'SENTRY-CENSUS %s units=%d',resource.path,count)
+            if type(ot.log)=='function' and census_logged[resource.path]~=count then
+                census_logged[resource.path]=count
+                pcall(ot.log,'SENTRY-CENSUS %s model=%s units=%d',resource.path,resource.model_hash,count)
             end
         end
         local allowed,why=measure()
@@ -1978,6 +2108,7 @@ return function(ot,config)
     local icon_material,icon_texture=config.icon_material,config.icon_texture
     local bar_uv,frame_uv=config.bar_uv,config.frame_uv
     local icons=type(config.icons)=='table' and config.icons or {}
+    local lift_delta=type(config.type_lift_delta)=='table' and config.type_lift_delta or {}
     local world,gui,disabled=nil,nil,false
     local reason,drawn,eligible,primitives,icons_drawn='no_world',0,0,0,0
     local missing,logged={},{}
@@ -2108,26 +2239,48 @@ return function(ot,config)
         elseif fraction>.25 then return 255,210,55
         else return 255,80,70 end
     end
+    local draw_report={}
     local function collect(c,records,frame,now)
         local labels,seen={},{}
+        -- 每个型号每种结果每 10 秒说一次，用来定位「有记录却没画出来」。
+        local function note(r,result,z,px,py)
+            if type(ot.log)~='function' then return end
+            local key=tostring(r.model_hash)..'/'..result
+            local last=draw_report[key]
+            if last and now>=last and now-last<10 then return end
+            draw_report[key]=now
+            local extra=''
+            if finite(z) then
+                extra=string.format(' z=%.2f',z)
+                if finite(px) and finite(py) then extra=extra..string.format(' px=%.0f py=%.0f',px,py) end
+            end
+            pcall(ot.log,'SENTRY-DRAW %s model=%s type=%s%s',result,tostring(r.model_hash),
+                tostring(r.network_type),extra)
+        end
         local basis={M.to_elements(c.pose)}
         for i=1,9 do if not finite(basis[i]) then error('invalid camera basis') end end
         local factor=2*math.tan(c.vertical_fov_radians/2)/c.viewport_height
         for unit,p in pairs(peaks) do if now-p.seen>2 or now<p.seen then peaks[unit]=nil end end
         for i=1,math.min(type(records)=='table' and #records or 0,128) do
             local r=records[i]
-            if fresh(r,frame,now) and not seen[r.unit] and finite(r.x) and finite(r.y) and finite(r.z) then
+            if not (fresh(r,frame,now) and not seen[r.unit] and finite(r.x) and finite(r.y) and finite(r.z)) then
+                note(r,'drop_record')
+            else
                 local ok,alive=pcall(Unit.alive,r.unit)
                 local wok,uw=false,nil
                 if ok and alive==true then wok,uw=pcall(Unit.world,r.unit) end
-                if wok and uw==world then
+                if not (wok and uw==world) then
+                    note(r,'drop_unit')
+                else
                     seen[r.unit]=true
                     local text,fraction,kind=display_value(r,now)
-                    local x,y,z=r.x,r.y,r.z+head_offset
+                    local x,y,z=r.x,r.y,r.z+head_offset+(lift_delta[r.network_type] or 0)
                     local dx,dy,dz=x-c.x,y-c.y,z-c.z
                     local depth=dx*c.forward_x+dy*c.forward_y+dz*c.forward_z
                     local distance2=dx*dx+dy*dy+dz*dz
-                    if depth>c.near_range+.01 and distance2<=max_distance^2 then
+                    if not (depth>c.near_range+.01 and distance2<=max_distance^2) then
+                        note(r,depth>c.near_range+.01 and 'drop_far' or 'drop_behind',z)
+                    else
                         local scale=depth*factor
                         local px=c.viewport_width/2+(dx*basis[1]+dy*basis[2]+dz*basis[3])/scale
                         local py=c.viewport_height/2+(dx*basis[7]+dy*basis[8]+dz*basis[9])/scale
@@ -2147,6 +2300,9 @@ return function(ot,config)
                             labels[#labels+1]={x=x,y=y,z=z,scale=scale*ui_scale,ui_scale=ui_scale,distance2=distance2,
                                 text=text,uv=uv,width=width,column_width=column_width,index=i,
                                 fraction=fraction,kind=kind}
+                            note(r,'shown',z,px,py)
+                        else
+                            note(r,'drop_screen',z,px,py)
                         end
                     end
                 end
@@ -2348,6 +2504,8 @@ return function(ot,profile)
     local S=ot.engine
     local App,Unit,Net,GS,V3=S.Application or {},S.Unit or {},S.Network or {},S.GameSession or {},S.Vector3 or {}
     local MAX_AGE,MAX_RECORDS,EPS2=0.08,128,0.001^2
+    -- 结构类单位与网络对象坐标本来就是错开的（补给舱差半米），复核沿用同一套容差。
+    local NEAR2=2.0^2
     local cache,world,session={},nil,nil
     local sampled_frame,sample_time,expires_at,last_frame,last_time=nil,nil,nil,nil,nil
     local reason,problem='empty',nil
@@ -2385,11 +2543,14 @@ return function(ot,profile)
         for _,b in ipairs(profile.bindings) do
             local model=type(b)=='table' and hex(b.model_hash,16,false)
             local th=type(b)=='table' and hex(b.type_hash,8,true)
+            -- 位置字段可以整条缺省：这类 schema 里没有 c{i(uTh>，由身份模块按唯一对象认领。
+            local has_position=b.position_field~=nil or b.position_slot~=nil
             if not model or not th or type(b.call)~='string' or #b.call==0
-                or type(b.position_field)~='string' or #b.position_field==0
-                or hex(b.position_field_hash,8,true)~='9a9b14c4'
-                or type(b.fields)~='table' or not integer(b.position_slot,1,#b.fields)
-                or hex(b.fields[b.position_slot],8,true)~='9a9b14c4' then
+                or type(b.fields)~='table' or #b.fields<1
+                or (has_position and (type(b.position_field)~='string' or #b.position_field==0
+                    or hex(b.position_field_hash,8,true)~='9a9b14c4'
+                    or not integer(b.position_slot,1,#b.fields)
+                    or hex(b.fields[b.position_slot],8,true)~='9a9b14c4')) then
                 problem='snapshot_invalid_binding';break
             end
             local spec=metric_specs[th] or b
@@ -2583,9 +2744,15 @@ return function(ot,profile)
         local tok,match=call(GS.game_object_is_type,ctx.session,r.network_goid,kind.call)
         if not tok or match~=true then return nil,'snapshot_object_type_changed' end
         local up=xyz(Unit.world_position,r.unit,1)
-        local np=xyz(GS.game_object_field,ctx.session,r.network_goid,kind.position_field)
-        if not up or not np then return nil,'snapshot_position_unavailable' end
-        return {record=r,unit_position=up,network_position=np,kind=kind,pair_matches=distance(up,np)<=EPS2}
+        if not up then return nil,'snapshot_position_unavailable' end
+        -- 没有位置字段的类型只能靠 goid 与类型核对；有位置字段的允许装配偏移。
+        local np=nil
+        if kind.position_field then
+            np=xyz(GS.game_object_field,ctx.session,r.network_goid,kind.position_field)
+            if not np then return nil,'snapshot_position_unavailable' end
+        end
+        local matches=not kind.position_field or distance(up,np)<=NEAR2
+        return {record=r,unit_position=up,network_position=np or up,kind=kind,pair_matches=matches}
     end
     function api.snapshot(requested_world)
         validations=validations+1;returned=0
@@ -2606,7 +2773,7 @@ return function(ot,profile)
         local unit_counts,id_counts={},{}
         for i,u in ipairs(valid) do
             for j,n in ipairs(valid) do
-                if n.kind.models[u.record.model_hash] and distance(u.unit_position,n.network_position)<=EPS2 then
+                if n.kind.models[u.record.model_hash] and distance(u.unit_position,n.network_position)<=NEAR2 then
                     unit_counts[i]=(unit_counts[i] or 0)+1;id_counts[j]=(id_counts[j] or 0)+1
                 end
             end
@@ -2924,7 +3091,12 @@ return {
         ['be95e875']={u0=0.75390625,v0=0.25390625,u1=0.99609375,v1=0.49609375}, -- StratagemTurretsRocket
         ['bf35608c']={u0=0.00390625,v0=0.00390625,u1=0.24609375,v1=0.24609375}, -- StratagemMannedMachinegun
         ['ec516bbd']={u0=0.50390625,v0=0.25390625,u1=0.74609375,v1=0.49609375}, -- StratagemTurretsGassentry
+        ['17db8107']={u0=0.25390625,v0=0.00390625,u1=0.49609375,v1=0.24609375}, -- 榴弹兵防卫墙
+        ['4e64c4dc']={u0=0.50390625,v0=0.75390625,u1=0.74609375,v1=0.99609375}, -- 武装补给舱的炮塔
     },
+    -- 墙上发射器的单位原点和墙根重合，全局 2.5 米会浮在 1.24 米高的墙上方一米多。
+    -- 减到离墙顶约 0.65 米；再往下会陷进墙体，被深度缓冲挡住。
+    type_lift_delta={['17db8107']=-0.6,['4e64c4dc']=-1.75},
 }
 
 end)()
@@ -3057,11 +3229,12 @@ local function report()
         log('tracked=%d records=%d network=%s identity=%s camera=%s labels=%s world=%s',
             tracked_count,#records,nr,ir,camera_reason,lr,world_reason)
         local sample_age=finite(ss.sample_time) and math.max(0,now-ss.sample_time) or nil
-        log('snapshot=%s age_ms=%s expires_at=%s sampled_frame=%s validation_frame=%s cadence=%s interval_ms=50 heavy_samples=%d last_sample_time=%s',
-            tostring(ss.reason),tostring(sample_age and sample_age*1000),tostring(ss.expires_at),
+        log('snapshot=%s records=%s returned=%s dropped=%s age_ms=%s expires_at=%s sampled_frame=%s validation_frame=%s cadence=%s interval_ms=50 heavy_samples=%d last_sample_time=%s',
+            tostring(ss.reason),tostring(ss.records),tostring(ss.returned),tostring(ss.dropped),
+            tostring(sample_age and sample_age*1000),tostring(ss.expires_at),
             tostring(ss.sampled_frame),tostring(ss.validation_frame),cadence_reason,heavy_samples,tostring(last_sample_time))
-        log('draw submitted=%s icons=%s primitives=%s assets_ready=%s bar_reference=%s',
-            tostring(ls.submitted),tostring(ls.icons),tostring(ls.primitives),
+        log('draw submitted=%s eligible=%s icons=%s primitives=%s assets_ready=%s bar_reference=%s',
+            tostring(ls.submitted),tostring(ls.eligible),tostring(ls.icons),tostring(ls.primitives),
             tostring(ls.assets_ready),tostring(ls.bar_reference))
         log('census=%s complete=%s queries=%s units_checked=%s candidates=%s elapsed_ms=%s',
             cr,tostring(cs.complete),tostring(cs.queries),tostring(cs.units_checked),tostring(cs.targets),tostring(cs.elapsed_ms))

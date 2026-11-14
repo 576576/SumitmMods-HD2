@@ -1366,8 +1366,8 @@ BAR_SPECS = {
     "gatling": ("icon_strat_hud_defensive_turrets_gatling", 1200, 1200, 6, AMMO_INK, None),
     "rocket": ("icon_strat_hud_defensive_turrets_rocket", 24, 24, 4, AMMO_INK, None),
     "flame": ("icon_strat_hud_flamethrower_turret", 400, 400, 4, AMMO_INK, None),
-    # 激光显示的是热量：满冷却时是 0%，条按剩余可用量画满。
-    "laser": ("icon_strat_hud_laser_cannon_turret", 100, 100, 5, AMMO_INK, "0%"),
+    # 激光显示的是热量：满冷却时温度 0，百分比读 0%，条只剩底槽。
+    "laser": ("icon_strat_hud_laser_cannon_turret", 0, 100, 4, AMMO_INK, "0%"),
     "autocannon": ("icon_strat_hud_defensive_turrets_autocannon", 60, 60, 4, AMMO_INK, None),
     "mortar": ("icon_strat_hud_defensive_turrets_mortar", 12, 12, 4, AMMO_INK, None),
     "mortar_gas": ("icon_strat_hud_defensive_turrets_mortar_gas", 12, 12, 4, AMMO_INK, None),
