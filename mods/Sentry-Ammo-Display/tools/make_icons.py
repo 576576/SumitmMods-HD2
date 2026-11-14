@@ -28,9 +28,13 @@ XAML_DIR = BUILD / "_icons_xaml" / "content" / "ui" / "shared" / "resources" / "
 SVG_DIR = BUILD / "_icons_svg" / "content" / "ui" / "shared" / "resources" / "generated_icons"
 
 # 输出名 → 来源。xaml 里的键是 DataTemplate.Icon.<键>。
+# layers 给定时是 (本体下标, 符号下标)：补给舱的 svg 第一层是六边形底板，
+# 不要；舱体（舱盖、两侧弹药箱、主体）进本体，右侧那门带枪管的炮塔进符号层。
 JOBS = (
-    ("wall", "xaml", "StratagemType.CoverGrenadeLauncher"),
-    ("ammo_pod", "svg", "booster_icons.svgs/DataTemplate.Icon.Booster.DefensiveAmmoPod.svg"),
+    ("wall", "xaml", "StratagemType.CoverGrenadeLauncher", None),
+    ("ammo_pod", "svg",
+     "booster_icons.svgs/DataTemplate.Icon.Booster.DefensiveAmmoPod.svg",
+     ((1, 2, 3, 4), (5,))),
 )
 
 
@@ -52,14 +56,17 @@ def main():
 
     extract(args.game_dir)
     OUT.mkdir(parents=True, exist_ok=True)
-    for name, kind, key in JOBS:
+    for name, kind, key, layers in JOBS:
         if kind == "xaml":
             text = (XAML_DIR / "stratagem_icons.xaml").read_text(encoding="utf-8")
             paths_ = svgicon.paths_from_xaml(text, key)
         else:
             text = (SVG_DIR / key).read_text(encoding="utf-8")
             paths_ = svgicon.paths_from_svg(text)
-        icon = svgicon.to_icon(paths_)
+        if layers:
+            icon = svgicon.to_icon_split(paths_, layers[0], layers[1])
+        else:
+            icon = svgicon.to_icon(paths_)
         icon.save(OUT / (name + ".png"))
         print("icon:", OUT / (name + ".png"), len(paths_), "paths")
 

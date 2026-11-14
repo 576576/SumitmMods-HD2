@@ -100,11 +100,11 @@ ALIASES = (
 WIDE = (
     ("29ae906ea485a7fa",
      "content/fac_helldivers/hellpod/expandable_cover/expandable_cover"),
-    ("02eecd0b1fa49630",
+    ("2eecd0b1fa49630",
      "content/fac_helldivers/equipment/support_weapons/grenade_launcher/grenade_launcher"),
     ("73681ffd58fa1a90",
      "content/fac_helldivers/hellpod/ammo_rack_mounted_turret/ammo_rack_mounted_turret"),
-    ("085c1edb038ec24e",
+    ("85c1edb038ec24e",
      "content/fac_helldivers/vehicles/frv/armaments/frv_mg/frv_mg"),
     ("444880f62ca7eae8",
      "content/fac_helldivers/vehicles/frv_heavy/armaments/"
@@ -118,24 +118,36 @@ local GROUPS={
     mortar={'51a0812e3bce2d74','299c0d3dfd2f0994','b2053a1838092f8b'},
     laser={'56070f36cfffa8a8'},
     tesla={'74599e56f72f9d7e'},
-    emplacement={'e977c49db7604f9','2b11c9e4980ec479','29ae906ea485a7fa','02eecd0b1fa49630'},
+    emplacement={'e977c49db7604f9','2b11c9e4980ec479','29ae906ea485a7fa','2eecd0b1fa49630'},
     supply={'73681ffd58fa1a90'},
-    mounted={'085c1edb038ec24e','444880f62ca7eae8'},
+    mounted={'85c1edb038ec24e','444880f62ca7eae8'},
 }
+-- 关掉的组连绑定一起摘掉：绑定校验要求每条 binding 的 model 都在 models 里，
+-- 只删 models 会让整个 profile 判为无效，所有炮塔一起不显示。
 local groups_applied=false
 local function apply_groups()
     if groups_applied then return end
     local on=type(_G)=='table' and _G.SENTRY_AMMO_GROUPS or nil
     if type(on)~='table' then return end
     groups_applied=true
+    local live=false
     for g,ids in pairs(GROUPS) do
-        if not on[g] then
+        if on[g] then
+            live=true
+        else
             for i=1,#ids do
                 network_profile.models[ids[i]]=nil
                 network_profile.model_resources[ids[i]]=nil
             end
         end
     end
+    if not live then return end
+    local keep,n={},0
+    for i=1,#network_profile.bindings do
+        local b=network_profile.bindings[i]
+        if network_profile.models[b.model_hash] then n=n+1;keep[n]=b end
+    end
+    network_profile.bindings=keep
 end
 '''
 
@@ -146,6 +158,9 @@ ALIAS_HEAD = """
 do
     local P=network_profile
     local function alias(base,new,path)
+        -- models 的键必须是去前导零的形态：运行时的绑定校验会先把 model_hash
+        -- 去掉前导零再查这张表，键带零就永远查不到，整块 profile 判为无效。
+        new=new:gsub('^0+','')
         P.models[new]=true
         P.model_resources[new]=path
         local n=0
@@ -164,6 +179,7 @@ do
         end
     end
     local function bind_all(new,path)
+        new=new:gsub('^0+','')
         P.models[new]=true
         P.model_resources[new]=path
         local have,n={},0
@@ -240,6 +256,18 @@ def check_wide_paths():
         raise SystemExit("WIDE 的模型 id 与路径哈希不符：%s" % ", ".join(bad))
 
 
+def check_id_forms():
+    """模型 id 一律写去前导零的形态。
+
+    models 的键与 binding 的 model_hash 都按这个形态写，运行时再 gsub('^0+','')
+    归一化后查表；数据里带零虽然跑得起来，但对不上 profile 原有的键，排查成本很高。
+    """
+    bad = [model for model, _ in WIDE if model != norm_hash(model)]
+    bad += [new for _, new, _ in ALIASES if new != norm_hash(new)]
+    if bad:
+        raise SystemExit("模型 id 必须去掉前导零：%s" % ", ".join(bad))
+
+
 def strip_comments(source):
     """只留下代码骨架，用来确认删注释没有动到逻辑。"""
     out = []
@@ -274,6 +302,7 @@ def main():
 
     check_alias_bases(text)
     check_wide_paths()
+    check_id_forms()
 
     if OLD_ADDON not in text:
         raise SystemExit("核心里的 addon 名不是预期的 %s" % OLD_ADDON)

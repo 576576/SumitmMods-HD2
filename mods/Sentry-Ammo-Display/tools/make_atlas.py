@@ -25,6 +25,8 @@ CELL = 128
 GRID = 4
 BODY = (102, 148, 80)
 SYMBOL = (237, 237, 237)
+# 补给舱图标两色：舱体白、炮塔绿，和预览里的那一条弹药显示一致。
+PALETTE = {"ammo_pod": ((237, 237, 237), (60, 214, 92))}
 
 # 材质 icons_depth 采样的是这张图集，除了 12 个图标格，还必须有这两格：
 #   (0,3) 四角括号 —— 图标外框； (3,3) 纯白 —— 弹药条的取样点。
@@ -66,9 +68,10 @@ def composed(name):
         raise SystemExit("缺少图标 %s（先用 filediver 导出到 build/icons）" % path)
     src = Image.open(path).convert("RGB")
     r, g, _ = src.split()
-    body = Image.new("RGBA", src.size, BODY + (0,))
+    body_ink, mark_ink = PALETTE.get(name, (BODY, SYMBOL))
+    body = Image.new("RGBA", src.size, body_ink + (0,))
     body.putalpha(r)
-    mark = Image.new("RGBA", src.size, SYMBOL + (0,))
+    mark = Image.new("RGBA", src.size, mark_ink + (0,))
     mark.putalpha(g)
     out = Image.alpha_composite(body, mark)
     # 预乘后再缩放，边缘不会发黑

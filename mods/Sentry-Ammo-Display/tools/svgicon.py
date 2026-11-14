@@ -245,6 +245,27 @@ def to_icon(paths, size=256, plate=0.9):
     return Image.fromarray(out, "RGB")
 
 
+def to_icon_split(paths, body, symbol, size=256):
+    """按下标把路径分进两个通道：body 进红、symbol 进绿，其余丢弃。
+
+    SVG 里的六边形底板要单独扔掉，光靠面积判断分不开（它只占画布的七成）。
+    """
+    parsed = [parse_path(d) for d, _ in paths]
+
+    def layer(indices):
+        out = np.zeros((size, size), np.float32)
+        for i in indices:
+            subs, rule = parsed[i]
+            out = np.maximum(out, fill(subs, rule, size, size))
+        return out
+
+    body_mask, mark = layer(body), layer(symbol)
+    out = np.zeros((size, size, 3), np.uint8)
+    out[..., 0] = np.clip(body_mask * 255, 0, 255).astype(np.uint8)
+    out[..., 1] = np.clip(mark * 255, 0, 255).astype(np.uint8)
+    return Image.fromarray(out, "RGB")
+
+
 def paths_from_xaml(text, key):
     """从战斗图标 xaml 里取某个 DataTemplate 的 (Data, Fill) 列表。"""
     head = 'x:Key="DataTemplate.Icon.%s"' % key

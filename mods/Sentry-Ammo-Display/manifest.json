@@ -1,12 +1,12 @@
 {
   "Version": 1,
   "Guid": "7a75be80-edbd-49a1-befe-477043c4ef5d",
-  "Name": "炮塔阵地弹药显示 MDL3版 1.5.11",
-  "Description": "在炮塔与阵地的头顶显示弹药条、剩余发数、热量或部署倒计时，远处也能看清；字号、图标大小、条宽高、遮挡透明度等 14 项设置由 MDL3 保存。需要已安装 MDL3 dev.32 或更新版本。",
+  "Name": "炮塔阵地弹药显示 MDL3版 1.5.16",
+  "Description": "在炮塔、阵地与载具炮位上显示弹药条、剩余发数、热量或部署倒计时；字号、图标大小、条宽高、遮挡透明度等 14 项设置由 MDL3 保存。需要已安装 MDL3 dev.32 或更新版本。",
   "Options": [
     {
       "Name": "核心（必选）",
-      "Description": "弹药读取与头顶显示本体。不勾这一项，下面几组装了也不会有任何显示。",
+      "Description": "弹药、热量与倒计时的读取本体；不勾这一项，其余各组都不会显示。",
       "Image": "thumbnail.png",
       "Include": [
         "core"
@@ -14,58 +14,58 @@
     },
     {
       "Name": "实弹哨戒（机枪 / 加特林 / 自动 / 火箭 / 火焰）",
-      "Description": "显示机枪 / 加特林 / 自动 / 火箭 / 火焰的头顶弹药。可与其他组同时勾选。",
+      "Description": "机枪、加特林、自动、火箭、火焰五种哨戒的剩余弹药。",
       "Image": "images/group_ammo.png",
       "Include": [
         "groups/ammo"
       ]
     },
     {
-      "Name": "迫击炮（迫击 / 电磁迫击 / 毒气迫击）",
-      "Description": "显示迫击 / 电磁迫击 / 毒气迫击的头顶弹药。可与其他组同时勾选。",
-      "Image": "images/group_mortar.png",
-      "Include": [
-        "groups/mortar"
-      ]
-    },
-    {
-      "Name": "激光哨戒",
-      "Description": "显示激光哨戒的头顶弹药。可与其他组同时勾选。",
+      "Name": "能量哨戒（激光）",
+      "Description": "激光哨戒的热量积累程度；满冷却时为 0%。",
       "Image": "images/group_laser.png",
       "Include": [
         "groups/laser"
       ]
     },
     {
+      "Name": "迫击炮（迫击 / 电磁迫击 / 毒气迫击）",
+      "Description": "迫击、电磁迫击、毒气迫击三型的剩余弹药。",
+      "Image": "images/group_mortar.png",
+      "Include": [
+        "groups/mortar"
+      ]
+    },
+    {
       "Name": "特斯拉塔",
-      "Description": "显示特斯拉塔的头顶弹药。可与其他组同时勾选。",
+      "Description": "按部署剩余时间估算的存续倒计时。",
       "Image": "images/group_tesla.png",
       "Include": [
         "groups/tesla"
       ]
     },
     {
-      "Name": "阵地（重机枪 / 反坦克 / 榴弹兵墙）",
-      "Description": "显示重机枪 / 反坦克 / 榴弹兵墙的头顶弹药。可与其他组同时勾选。",
+      "Name": "固定阵地（重机枪 / 反坦克 / 榴弹兵墙）",
+      "Description": "重机枪阵地、E/AT-12 反坦克炮台、GL-21 榴弹兵墙的剩余弹药。",
       "Image": "images/group_emplacement.png",
       "Include": [
         "groups/emplacement"
       ]
     },
     {
-      "Name": "武装补给（补给舱 / 补给车）",
-      "Description": "显示补给舱 / 补给车的头顶弹药。可与其他组同时勾选。",
-      "Image": "images/group_supply.png",
-      "Include": [
-        "groups/supply"
-      ]
-    },
-    {
       "Name": "移动阵地（重机枪 FRV / 喷火 FRV）",
-      "Description": "显示重机枪 FRV / 喷火 FRV的头顶弹药。可与其他组同时勾选。",
+      "Description": "重机枪 FRV 与喷火 FRV 车载炮塔的剩余弹药。",
       "Image": "images/group_mounted.png",
       "Include": [
         "groups/mounted"
+      ]
+    },
+    {
+      "Name": "武装补给（补给舱 / 补给车）",
+      "Description": "武装重新补给舱与补给型侦察车的炮塔弹药。",
+      "Image": "images/group_supply.png",
+      "Include": [
+        "groups/supply"
       ]
     }
   ],

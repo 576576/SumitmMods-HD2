@@ -41,19 +41,26 @@ GROUP_MODULE_PREFIX = "mods/sumitm/sentry_ammo_display/group_"
 
 GROUPS = (
     ("ammo", "实弹哨戒", "机枪 / 加特林 / 自动 / 火箭 / 火焰",
+     "机枪、加特林、自动、火箭、火焰五种哨戒的剩余弹药。",
      "8f3a1c62-2b4d-4e71-9a05-6c1d7e8f9a10"),
-    ("mortar", "迫击炮", "迫击 / 电磁迫击 / 毒气迫击",
-     "b1d7e405-6a29-4c83-8f17-2e9b0d4a5c23"),
-    ("laser", "激光哨戒", "激光哨戒",
+    ("laser", "能量哨戒", "激光",
+     "激光哨戒的热量积累程度；满冷却时为 0%。",
      "c4e2a918-3f05-4b6d-a271-58d09e6b4f34"),
+    ("mortar", "迫击炮", "迫击 / 电磁迫击 / 毒气迫击",
+     "迫击、电磁迫击、毒气迫击三型的剩余弹药。",
+     "b1d7e405-6a29-4c83-8f17-2e9b0d4a5c23"),
     ("tesla", "特斯拉塔", "特斯拉塔",
+     "按部署剩余时间估算的存续倒计时。",
      "d6f0b273-9c14-4a58-b309-71e2c5a8d045"),
-    ("emplacement", "阵地", "重机枪 / 反坦克 / 榴弹兵墙",
+    ("emplacement", "固定阵地", "重机枪 / 反坦克 / 榴弹兵墙",
+     "重机枪阵地、E/AT-12 反坦克炮台、GL-21 榴弹兵墙的剩余弹药。",
      "e8c5d194-7b30-4f62-9a83-0d17b4e6c956"),
-    ("supply", "武装补给", "补给舱 / 补给车",
-     "f2a1c706-5d48-4b93-8e20-3c6a91d5b078"),
     ("mounted", "移动阵地", "重机枪 FRV / 喷火 FRV",
+     "重机枪 FRV 与喷火 FRV 车载炮塔的剩余弹药。",
      "ded8fc28-b673-49b5-9c1d-ddb69aff9c48"),
+    ("supply", "武装补给", "补给舱 / 补给车",
+     "武装重新补给舱与补给型侦察车的炮塔弹药。",
+     "f2a1c706-5d48-4b93-8e20-3c6a91d5b078"),
 )
 
 M64 = 0xC6A4A7935BD1E995
@@ -93,7 +100,7 @@ def build_archive(source: bytes, module: str) -> bytes:
 def group_marks():
     """每个组一个极小 patch：里面只有一条把组名写进全局表的 lua。"""
     out = []
-    for key, label, detail, guid in GROUPS:
+    for key, label, detail, desc, guid in GROUPS:
         module = GROUP_MODULE_PREFIX + key
         source = ("""-- HD2-Addon: %s
 local t=rawget(_G,'SENTRY_AMMO_GROUPS')
@@ -112,7 +119,7 @@ t.%s=true
         (folder / name).write_bytes(archive)
         for suffix in (".gpu_resources", ".stream"):
             (folder / (name + suffix)).write_bytes(b"")
-        out.append((key, label, detail, guid, "groups/%s/%s" % (key, name)))
+        out.append((key, label, detail, desc, "groups/%s/%s" % (key, name)))
     return out
 
 
@@ -232,19 +239,19 @@ def check(rt):
 
 
 def apply_options(marks):
-    """清单里六个勾选：核心必选，其余五组各自带一个标记 patch。"""
+    """清单里一个必选加七个分组勾选，顺序即 GROUPS 的顺序。"""
     path = ROOT / "manifest.json"
     m = json.loads(path.read_text(encoding="utf-8"))
     options = [{
         "Name": "核心（必选）",
-        "Description": "弹药读取与头顶显示本体。不勾这一项，下面几组装了也不会有任何显示。",
+        "Description": "弹药、热量与倒计时的读取本体；不勾这一项，其余各组都不会显示。",
         "Image": "thumbnail.png",
         "Include": ["core"],
     }]
-    for key, label, detail, guid, rel in marks:
+    for key, label, detail, desc, rel in marks:
         options.append({
-            "Name": label if detail == label else "%s（%s）" % (label, detail),
-            "Description": "显示%s的头顶弹药。可与其他组同时勾选。" % detail,
+            "Name": label if detail in ("", label) else "%s（%s）" % (label, detail),
+            "Description": desc,
             "Image": "images/group_%s.png" % key,
             "Include": ["groups/" + key],
         })
