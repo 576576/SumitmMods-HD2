@@ -19,8 +19,10 @@ from nacl.bindings import crypto_box_seal_open
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "vendor" / "ordnance"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "toolchain"))
 
 import hd2edit  # noqa: E402
+from hd2tool import read_lua_bundle  # noqa: E402
 
 PK, SK = hd2edit.PK, hd2edit.SK
 ROOT = Path(__file__).resolve().parent.parent
@@ -32,11 +34,9 @@ EXPECT = {"轨道精准": 343, "轨道毒气": 82, "轨道炮": 52, "轨道电�
 TARGET_REL = Path("data") / "game" / "generated_projectile_settings.dl_bin"
 
 
-def archive_payload(archive: bytes, offset=192) -> bytes:
-    size = struct.unpack_from("<I", archive, offset)[0]
-    typ = struct.unpack_from("<I", archive, offset + 4)[0]
-    assert typ == 2, f"unexpected payload type {typ}"
-    return archive[offset + 8:offset + 8 + size]
+def archive_payload(archive: bytes) -> bytes:
+    """取出归档里的 lua 文本；类型表 / 行表不符合单 lua 布局会在这里抛错。"""
+    return read_lua_bundle(archive)[1]
 
 
 def record_base(plain, rid):

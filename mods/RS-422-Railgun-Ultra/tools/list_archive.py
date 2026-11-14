@@ -25,11 +25,12 @@ def rows(buf):
 
 
 def type_names(buf):
+    """类型条目从 72 字节处起，32 字节一条：+8 是类型 hash，+16 是条数。"""
     types = u32(buf, 4)
     names = []
     for i in range(types):
         o = 72 + i * 32
-        names.append(buf[o:o + 8].hex())
+        names.append("%016x(%d)" % (struct.unpack_from("<Q", buf, o + 8)[0], u32(buf, o + 16)))
     return names
 
 

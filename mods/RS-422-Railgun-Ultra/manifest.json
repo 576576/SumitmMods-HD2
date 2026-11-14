@@ -1,7 +1,7 @@
 {
   "Version": 1,
   "Guid": "7596f211-b832-47c0-86bd-7ae31e92fe80",
-  "Name": "RS-422 Railgun Ultra 1.0.0",
+  "Name": "RS-422 Railgun Ultra 1.0.1",
   "IconPath": "thumbnail.png",
   "Description": "把 RS-422 Railgun 的命中爆炸换成轨道打击：精准、毒气、轨道炮、电磁四种，每次只勾一个。离线改写密封数据表，不加载 FFI、不读内存、不依赖加载器；首次启动写入，重启游戏后生效。 / Retargets the RS-422 Railgun's impact explosion to an orbital strike; four options, tick one. Rewrites the sealed data table offline — no FFI, no memory access, no loader; applied on first launch, effective after a restart.",
   "Options": [

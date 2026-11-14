@@ -5,13 +5,15 @@ patch_0 archive. The Lua writes a precomputed set of ciphertext bytes — tag
 included — so the game's sealed table still verifies after the rewrite.
 """
 import json
-import struct
 import sys
 import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 DIST = ROOT.parents[1] / "dist"
+sys.path.insert(0, str(ROOT.parents[1] / "toolchain"))
+from hd2tool import build_lua_bundle, read_lua_bundle  # noqa: E402
+
 ZIP_NAME = "RS-422-Railgun-Ultra.zip"
 BUNDLE = "9ba626afa44a3aa3"
 SRC = ROOT / "stock" / "generated_projectile_settings.orig.dl_bin"
@@ -20,7 +22,8 @@ if not VERSION:
     raise SystemExit("version.txt 是空的")
 
 BASE_NAME = "RS-422 Railgun Ultra"
-LUA_TYPE = bytes.fromhex("e217d12cfa8d4ea1")
+# addon 名统一在本仓库的命名空间下，目录名与 mod 同名。
+MODULE_PREFIX = "mods/sumitm/rs422_railgun_ultra/retarget_"
 
 # key, 中文名, 英文名
 OPTIONS = [
@@ -139,53 +142,15 @@ log("已写入 " .. LABEL .. "；重启游戏后生效")
 '''
 
 
-def idstring64(text: str) -> bytes:
-    M, MASK = 0xC6A4A7935BD1E995, (1 << 64) - 1
-    data = text.encode()
-    n = len(data)
-    h = (n * M) & MASK
-    whole = n - n % 8
-    for i in range(0, whole, 8):
-        v = int.from_bytes(data[i:i + 8], "little")
-        v = (v * M) & MASK
-        v ^= v >> 47
-        v = (v * M) & MASK
-        h ^= v
-        h = (h * M) & MASK
-    if whole < n:
-        h ^= int.from_bytes(data[whole:], "little")
-        h = (h * M) & MASK
-    h ^= h >> 47
-    h = (h * M) & MASK
-    h ^= h >> 47
-    return h.to_bytes(8, "little")
-
-
 def build_archive(module: str, source: bytes) -> bytes:
-    header = bytearray(192)
-    struct.pack_into("<I", header, 0, 0xF0000011)
-    struct.pack_into("<I", header, 4, 1)          # types
-    struct.pack_into("<I", header, 8, 1)          # rows
-    total = 192 + 8 + len(source)
-    struct.pack_into("<Q", header, 0x20, total)   # file size
-    header[0x48:0x50] = LUA_TYPE
-    struct.pack_into("<I", header, 0x50, 1)
-    struct.pack_into("<I", header, 0x58, 16)
-    struct.pack_into("<I", header, 0x5C, 16)
-    row = 0x68
-    header[row:row + 8] = idstring64(module)
-    header[row + 8:row + 16] = LUA_TYPE
-    struct.pack_into("<I", header, row + 16, 192)
-    struct.pack_into("<I", header, row + 0x38, 8 + len(source))
-    payload = struct.pack("<II", len(source), 2) + source
-    return bytes(header) + payload
+    return build_lua_bundle(module, source)
 
 
 def lua_source(key, label, baked) -> str:
     offsets = baked["union"]
     known = ", ".join('"%s"' % s for s in baked["states"].values())
     return (LUA_TEMPLATE
-            .replace("__MODULE__", "mods/rs422/retarget_" + key)
+            .replace("__MODULE__", MODULE_PREFIX + key)
             .replace("__LABEL__", label)
             .replace("__VERSION__", VERSION)
             .replace("__SIZE__", str(len(SRC.read_bytes())))
@@ -233,7 +198,9 @@ def main():
             if label not in baked["variants"]:
                 raise SystemExit("补丁表里没有 %s，先跑 bake_lua_patch.py" % label)
             source = lua_source(key, label, baked).encode("utf-8")
-            archive = build_archive("mods/rs422/retarget_" + key, source)
+            archive = build_archive(MODULE_PREFIX + key, source)
+            if read_lua_bundle(archive)[1] != source:
+                raise SystemExit("选项 %s 的归档读回来不是预期 lua" % key)
             base = "options/%s/%s" % (key, BUNDLE)
             z.writestr(base + ".patch_0", archive)
             z.writestr(base + ".patch_0.gpu_resources", b"")
