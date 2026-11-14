@@ -129,11 +129,14 @@ WIDE = (
 )
 
 
-# 只进 census 白名单、不建绑定的模型：用来确认某个 unit 到底在不在场上。
-# 补给车车体的网络类型没有位置字段也没有 rounds_remaining，绑定等字段确认后再加。
+# 只注册模型与资源路径、绑定另有来源的 unit：
+# 补给车车体的绑定在 LATE_BINDINGS 里，这里负责让它进 census 白名单；
+# 补给舱体是附属部件，只用来确认它在场上，不参与识别。
 CENSUS_EXTRA = (
     ("9b2140378640432e",
      "content/fac_helldivers/vehicles/frv_supply/frv_supply"),
+    ("583ecde0d7718126",
+     "content/fac_helldivers/hellpod/hellpod/hellpod"),
 )
 
 GROUPS = r'''
@@ -227,9 +230,11 @@ do
 
 ALIAS_TAIL = "end\n"
 
-# 榴弹兵墙挂的榴弹发射器、武装补给舱的枪：两条网络类型在 network_config 里存在，
-# 但上游清单没收录。名字由 32 位 hash 碰撞生成（引擎只比 murmur64 高 32 位）。
-# 前者的 schema 整条没有 `c{i(uTh>`，binding 不带位置字段，由身份模块按「场上唯一对象」认领。
+# 榴弹兵墙挂的榴弹发射器、武装补给舱的枪、补给车的炮塔：三条网络类型在
+# network_config 里存在，但上游清单没收录。名字由 32 位 hash 碰撞生成
+# （引擎只比 murmur64 高 32 位）。前者的 schema 整条没有 `c{i(uTh>`，
+# binding 不带位置字段，由身份模块按「场上唯一对象」认领；后两个有位置字段，
+# 与补给舱那条枪的字段表完全相同。
 LATE_TYPES = (
     ("17db8107", "!!!H[UA2", 24, None,
      ("50ac6619", "8bbeb160", "20605662", "2d27198c", "98b4aaf0", "c336a25c", "3132608f",
@@ -243,11 +248,19 @@ LATE_TYPES = (
       "9611c029", "cc0b45e5", "9d5d6cc7", "49c250a6", "31f86165", "09d8bef4", "3132608f",
       "95c46304", "ec64918b", "d7a5d63e", "4a893e74", "67526982", "31182caf", "6f3ab277",
       "4cbcc2a2", "7030c54e")),
+    ("6d745627", "!!!yz6.F", 31, 3,
+     ("50ac6619", "98b4aaf0", "9a9b14c4", "c336a25c", "3ccffa7f", "d22b948c", "c20428c6",
+      "6d1d5cfb", "a4c332a8", "9bbb856e", "b897e2d8", "a1659a75", "d5a66654", "d7082cbf",
+      "ac08fe53", "7a4bdbbe", "5dd8181b", "b6347304", "078c5d3b", "60e13e87", "e0a79052",
+      "9611c029", "cc0b45e5", "9d5d6cc7", "49c250a6", "31f86165", "09d8bef4", "3132608f",
+      "95c46304", "ec64918b", "d7a5d63e", "4a893e74", "67526982", "31182caf", "6f3ab277",
+      "4cbcc2a2", "7030c54e", "cd889dbc")),
 )
 
 LATE_BINDINGS = (
     ("2eecd0b1fa49630", "17db8107"),
     ("73681ffd58fa1a90", "4e64c4dc"),
+    ("9b2140378640432e", "6d745627"),
 )
 
 
@@ -276,12 +289,14 @@ def alias_block():
     lines = [ALIAS_HEAD]
     for base, new, path in ALIASES:
         lines.append("    alias('%s', '%s', '%s')\n" % (base, new, path))
+    # 通配绑定排在 late 之后：它按「当前已有的每个 type_hash」克隆，跑在 late 之前
+    # 就拿不到后注入的类型，FRV 这类共用晚期类型的挂件会一条都绑不上。
+    lines.append(late_block())
     for new, path in WIDE:
         lines.append("    bind_all('%s', '%s')\n" % (new, path))
     for new, path in CENSUS_EXTRA:
         lines.append("    P.models['%s']=true\n" % new)
         lines.append("    P.model_resources['%s']='%s'\n" % (new, path))
-    lines.append(late_block())
     lines.append(ALIAS_TAIL)
     return "".join(lines)
 
@@ -318,6 +333,7 @@ def check_profile_links(text):
     keys |= {norm_hash(m) for m, _ in WIDE}
     keys |= {norm_hash(n) for _, n, _ in ALIASES}
     keys |= {norm_hash(m) for m, _ in LATE_BINDINGS}
+    keys |= {norm_hash(m) for m, _ in CENSUS_EXTRA}
     bad = sorted({m for m in BINDING_ID_RE.findall(text) if norm_hash(m) not in keys})
     if bad:
         raise SystemExit("binding 的 model_hash 不在 models 清单里：%s" % ", ".join(bad))

@@ -57,7 +57,7 @@ end,
 end)()
 local S=ot.engine
 local App,Unit=S.Application or {},S.Unit or {}
-local VERSION='1.5.28'
+local VERSION='1.5.37'
 local create_network = (function()
 -- Read-only ammunition/temperature and explicitly estimated Tesla lifetime provider.
 -- factory(ot, profile, identity) -> reset(world), sample(unit, model_hash), forget(unit),
@@ -820,12 +820,29 @@ return function(ot,profile)
     local RECHECK_INTERVAL,BASE_AGE,MAX_AGE,EPS2=10,12,120,0.001^2
     -- 结构类单位（补给舱、载具）的 unit 原点与网络对象坐标不重合，精确到毫米会全部落空。
     local NEAR2=2.0^2
+    -- 补给车的网络对象坐标在落点生成后就不再跟随载具，z 停在落点上方二十几米，
+    -- 只有 x/y 还贴着车。放宽只给车体模型本身：这个类型经 bind_all 也挂在别的
+    -- 模型上，按类型放宽会让它们一起去抢同一个对象。
+    -- 三项合成一张表，只占一个 upvalue：下面那个大函数的 60 个名额已经很紧。
+    local VEHICLE={model='9b2140378640432e',type='6d745627',horiz2=8.0^2}
+    -- 该类型是否落在这个 unit 与这个对象之间。
+    local function within(type_hash,u,c)
+        local dx,dy=u.x-c.x,u.y-c.y
+        if type_hash==VEHICLE.type and u.model_hash==VEHICLE.model then
+            return dx*dx+dy*dy<=VEHICLE.horiz2
+        end
+        local dz=u.z-c.z
+        return dx*dx+dy*dy+dz*dz<=EPS2
+    end
     local world,session,rows,schemas=nil,nil,{},{}
     local pending,refresh,ph,rh={},{},1,1
     local resolved,resolved_frame={},nil
     local established,retired_units={},{}
     local unresolved_log_time=nil
     local discovery_complete,discovery_reason,retained_count,new_count=false,'awaiting_discovery',0,0
+    -- 字段表与运行时 schema 不符的类型：只停用这一条，不参与候选。
+    -- 若把它计入 candidate_problem，discovery 永远不 complete，所有型号一起不显示。
+    local schema_bad={}
     local validation_time,validation_frame=nil,nil
     local reason,problem='no_world',nil
     local problem_detail=nil
@@ -836,6 +853,7 @@ return function(ot,profile)
     local types,models,by_type={},{},{}
     local all_types,active_types,scope_signature={}, {},nil
     local diag_logged={}
+    local vehicle_logged={}
     local age_limit,required_age,classification_rate=BASE_AGE,BASE_AGE,nil
     local rate_started,rate_last_time,rate_checks,sweep_seconds,oldest_negative_age=nil,nil,0,nil,0
     local throughput_limited=false
@@ -1297,7 +1315,14 @@ return function(ot,profile)
                 -- 交给下面「唯一对象」那一层处理。
             elseif row.checked_frame==frame then
                 local valid,schema_reason=schema(row.kind)
-                if not valid then candidate_problem=candidate_problem or (schema_reason..':'..row.kind.type_hash)
+                if not valid then
+                    if schema_bad[row.kind.type_hash]==nil then
+                        schema_bad[row.kind.type_hash]=schema_reason
+                        if type(ot.log)=='function' then
+                            pcall(ot.log,'SENTRY-SCHEMA unusable type=%s reason=%s',
+                                row.kind.type_hash,schema_reason)
+                        end
+                    end
                 else
                     local ok,value=call(GS.game_object_field,session,id,row.kind.position_field)
                     local pos=ok and xyz(value)
@@ -1324,9 +1349,60 @@ return function(ot,profile)
                         nearest_unit_position={x=u.x,y=u.y,z=u.z}
                         nearest_network_vector={x=c.x,y=c.y,z=c.z}
                     end
-                    if distance2<=EPS2 then
+                    if within(c.kind.type_hash,u,c) then
                         unit_count[u.unit]=(unit_count[u.unit] or 0)+1
                         id_count[c.id]=(id_count[c.id] or 0)+1;choice[u.unit]=c
+                    end
+                end
+            end
+        end
+        -- 车载武器的网络对象只固定在落点、不跟车，而且同族对象可能不止一个，
+        -- 按全局唯一判定会一直 not_unique。只对车体模型本身放宽：该模型在场上
+        -- 只有一个单位时，按水平最近取一个尚未被占用的候选；车开走之后退化为
+        -- 「全图该类型唯一对象」。已经配过的对象优先，避免车开动后锚点乱跳。
+        local vehicle_choice={}
+        do
+            local per_model,per_type={},{}
+            for _,u in ipairs(units) do per_model[u.model_hash]=(per_model[u.model_hash] or 0)+1 end
+            for _,c in ipairs(candidates) do
+                local t=c.kind.type_hash
+                if t==VEHICLE.type then per_type[t]=(per_type[t] or 0)+1 end
+            end
+            for _,u in ipairs(units) do
+                if u.model_hash==VEHICLE.model and per_model[u.model_hash]==1 and not choice[u.unit] then
+                    local best,best2=nil,nil
+                    local p=established[u.unit]
+                    if p then
+                        -- 沿用旧锚点也必须先确认它现在仍是这个类型：空投舱换成车体后
+                        -- 对象类型会变，此时继续认旧 goid 会让采样每帧 type_mismatch。
+                        for _,c in ipairs(candidates) do
+                            if c.id==p.goid and not id_count[c.id]
+                                and c.kind.type_hash==VEHICLE.type and c.kind.models[u.model_hash] then
+                                best,best2=c,0
+                            end
+                        end
+                    end
+                    for _,c in ipairs(candidates) do
+                        if c.kind.type_hash==VEHICLE.type and c.kind.models[u.model_hash]
+                            and not id_count[c.id] then
+                            local dx,dy=u.x-c.x,u.y-c.y
+                            local d2=dx*dx+dy*dy
+                            if d2<=VEHICLE.horiz2 and (not best2 or d2<best2) then best,best2=c,d2 end
+                        end
+                    end
+                    if not best then
+                        for _,c in ipairs(candidates) do
+                            local t=c.kind.type_hash
+                            if t==VEHICLE.type and c.kind.models[u.model_hash] and per_type[t]==1
+                                and not id_count[c.id] then
+                                if best then best=false;break end
+                                best=c
+                            end
+                        end
+                    end
+                    if best then
+                        unit_count[u.unit],id_count[best.id],choice[u.unit]=1,1,best
+                        vehicle_choice[u.model_hash]=best
                     end
                 end
             end
@@ -1337,7 +1413,8 @@ return function(ot,profile)
         for _,u in ipairs(units) do
             if not choice[u.unit] then
                 for _,c in ipairs(candidates) do
-                    if c.kind.models[u.model_hash] and not id_count[c.id] then
+                    if c.kind.models[u.model_hash] and not id_count[c.id]
+                        and c.kind.type_hash~=VEHICLE.type then
                         local distance2=(u.x-c.x)^2+(u.y-c.y)^2+(u.z-c.z)^2
                         if distance2>EPS2 and distance2<=NEAR2 then
                             near_units[u.unit]=(near_units[u.unit] or 0)+1
@@ -1481,6 +1558,17 @@ return function(ot,profile)
             unresolved_log_time=now
             pcall(ot.log,'SENTRY-IDENTITY unresolved %d: %s',#blocked,table.concat(blocked,' '))
         end
+        -- 车载类型的配对结果：pick 出现说明走了唯一性豁免，missing 说明这个模型
+        -- 在场却没有能配上的对象。
+        if type(ot.log)=='function' then
+            for model,c in pairs(vehicle_choice) do
+                local last=vehicle_logged[model]
+                if not last or now-last>=60 then
+                    vehicle_logged[model]=now
+                    pcall(ot.log,'SENTRY-IDENTITY vehicle model=%s type=%s pick=%s',model,c.kind.type_hash,tostring(c.id))
+                end
+            end
+        end
         resolved_frame=frame
         if bound>0 then
             reason=discovery_complete and 'inferred_unique_bindings' or 'retained_verified_bindings'
@@ -1548,6 +1636,9 @@ return function(ot,profile)
     local reason='no_world'
     local queries,units_checked,target_count,elapsed_ms=0,0,0,0
     local census_logged={}
+    -- 已知的附属部件：挂在真正带武器的单位上，自己从来没有弹药。
+    -- 只统计不参与识别，否则每 15 秒的 unresolved 里会一直挂着它们。
+    local ACCESSORY={['29ae906ea485a7fa']=true,['583ecde0d7718126']=true}
     local complete=false
     local function finite(x)
         return type(x)=='number' and x==x and x>-math.huge and x<math.huge
@@ -1682,7 +1773,7 @@ return function(ot,profile)
                 seen[unit]=true;units_checked=units_checked+1
                 local valid,why=validate(unit,resource.model_hash)
                 if valid==nil then return fail(why) end
-                if valid then
+                if valid and not ACCESSORY[resource.model_hash] then
                     targets[#targets+1]={unit=unit,model_hash=resource.model_hash}
                     if #targets>MAX_TARGETS then return fail('sentry_candidate_limit') end
                 end
@@ -1692,7 +1783,8 @@ return function(ot,profile)
             end
             if type(ot.log)=='function' and census_logged[resource.path]~=count then
                 census_logged[resource.path]=count
-                pcall(ot.log,'SENTRY-CENSUS %s model=%s units=%d',resource.path,resource.model_hash,count)
+                pcall(ot.log,'SENTRY-CENSUS %s model=%s units=%d%s',resource.path,resource.model_hash,count,
+                    ACCESSORY[resource.model_hash] and ' accessory' or '')
             end
         end
         local allowed,why=measure()
@@ -2163,6 +2255,15 @@ return function(ot,config)
     local icon_material,icon_texture=config.icon_material,config.icon_texture
     local bar_uv,frame_uv=config.bar_uv,config.frame_uv
     local icons=type(config.icons)=='table' and config.icons or {}
+    -- 按模型兜底：同一个 unit 模型的不同网络类型（旧数据残留的类型 id、野生的
+    -- 固定阵地）不一定都收在 icons 里，缺项时整套图标与四角框都不会画，只剩弹药条。
+    -- 放在模块内而不是 profile：profile 是与 MDL3 共享的表，不往里加新键。
+    local model_icons={
+        ['e977c49db7604f9']={u0=0.00390625,v0=0.00390625,u1=0.24609375,v1=0.24609375}, -- manned_turret 人操重机枪
+        ['37cde43876ba26bb']={u0=0.50390625,v0=0.00390625,u1=0.74609375,v1=0.24609375}, -- turret_machinegun_gpmg
+        ['61d9dda22a59e9bc']={u0=0.75390625,v0=0.00390625,u1=0.99609375,v1=0.24609375}, -- turret 加特林
+        ['cbfe1fc7158347f3']={u0=0.00390625,v0=0.50390625,u1=0.24609375,v1=0.74609375}, -- aa_turret 机炮
+    }
     local lift_delta=type(config.type_lift_delta)=='table' and config.type_lift_delta or {}
     local world,gui,disabled=nil,nil,false
     local reason,drawn,eligible,primitives,icons_drawn='no_world',0,0,0,0
@@ -2260,7 +2361,7 @@ return function(ot,config)
                     and finite(r.metric_max) and r.metric_max>0 and r.metric_value<=r.metric_max))
     end
     local function valid_icon(r)
-        local uv=icons[r.network_type]
+        local uv=icons[r.network_type] or model_icons[r.model_hash]
         return valid_uv(uv) and uv or nil
     end
     local function display_value(r,now)
@@ -2561,6 +2662,15 @@ return function(ot,profile)
     local MAX_AGE,MAX_RECORDS,EPS2=0.08,128,0.001^2
     -- 结构类单位与网络对象坐标本来就是错开的（补给舱差半米），复核沿用同一套容差。
     local NEAR2=2.0^2
+    -- 车载武器的对象坐标固定在落点、不跟车，位置校验对它们没有意义，
+    -- 只靠 goid + 类型 + 模型核对。
+    local VEHICLE_TYPE='6d745627'
+    local function within(type_hash,a,b)
+        if type_hash==VEHICLE_TYPE then return true end
+        local dx,dy=a.x-b.x,a.y-b.y
+        local dz=a.z-b.z
+        return dx*dx+dy*dy+dz*dz<=NEAR2
+    end
     local cache,world,session={},nil,nil
     local sampled_frame,sample_time,expires_at,last_frame,last_time=nil,nil,nil,nil,nil
     local reason,problem='empty',nil
@@ -2748,33 +2858,38 @@ return function(ot,profile)
         if #records==0 then api.clear('snapshot_empty_source');world=next_world;return true end
         local next_cache,units,ids={},{},{}
         last_metric_drop=nil
-        for _,r in ipairs(records) do
+        -- 单条记录不合格只丢这一条：一处配对或类型写错不该让所有型号一起没有弹药条。
+        local function convert(r)
             if type(r)~='table' or r.verified~=true or r.short_snapshot==true
                 or r.sampled_frame~=ctx.frame or r.world~=next_world or type(r.unit)~='userdata'
                 or not integer(r.network_goid,0,2147483647)
                 or r.network_goid==32767 or not finite(r.x) or not finite(r.y) or not finite(r.z)
                 or (r.session~=nil and r.session~=ctx.session)
                 or (profile.schema_sha256~=nil and r.schema_sha256~=profile.schema_sha256) then
-                return reject('snapshot_source_not_current_network_sample')
+                return nil,'snapshot_source_not_current_network_sample'
             end
             local model,err=unit_model(r.unit,next_world)
-            if not model then return reject(err) end
+            if not model then return nil,err end
             local th=hex(r.network_type,8,true);local kind=types[th]
             if not kind or not kind.models[model] or (r.model_hash~=nil and hex(r.model_hash,16,false)~=model) then
-                return reject('snapshot_model_type_mismatch')
+                return nil,'snapshot_model_type_mismatch'
             end
-            if units[r.unit] or ids[r.network_goid] then return reject('snapshot_duplicate_source_identity') end
-            units[r.unit],ids[r.network_goid]=true,true
+            if units[r.unit] or ids[r.network_goid] then return nil,'snapshot_duplicate_source_identity' end
             local metric=metric_record(r,kind,ctx)
-            if metric then
-                local saved=copy_record(r)
-                for _,key in ipairs(metric_keys) do saved[key]=metric[key] end
-                saved.model_hash,saved.network_type,saved.session=model,th,ctx.session
-                saved.sample_time,saved.expires_at=ctx.now,ctx.now+MAX_AGE
-                next_cache[#next_cache+1]=saved
+            if not metric then return nil,'snapshot_invalid_metric' end
+            units[r.unit],ids[r.network_goid]=true,true
+            local saved=copy_record(r)
+            for _,key in ipairs(metric_keys) do saved[key]=metric[key] end
+            saved.model_hash,saved.network_type,saved.session=model,th,ctx.session
+            saved.sample_time,saved.expires_at=ctx.now,ctx.now+MAX_AGE
+            return saved
+        end
+        for _,r in ipairs(records) do
+            local saved,skip=convert(r)
+            if saved then next_cache[#next_cache+1]=saved
             else
                 dropped=dropped+1;metric_dropped=metric_dropped+1
-                last_metric_drop='snapshot_invalid_metric'
+                last_metric_drop=last_metric_drop or skip
             end
         end
         cache,world,session=next_cache,next_world,ctx.session
@@ -2788,7 +2903,9 @@ return function(ot,profile)
         local vok,x,y,z=call(V3.to_elements,p)
         if vok and finite(x) and finite(y) and finite(z) then return {x=x,y=y,z=z} end
     end
-    local function distance(a,b) return (a.x-b.x)^2+(a.y-b.y)^2+(a.z-b.z)^2 end
+    -- 类型相关的距离判定统一走 within（见上）。
+
+
     local function validate(r,ctx)
         local model,why=unit_model(r.unit,ctx.world)
         if not model then return nil,why end
@@ -2806,7 +2923,8 @@ return function(ot,profile)
             np=xyz(GS.game_object_field,ctx.session,r.network_goid,kind.position_field)
             if not np then return nil,'snapshot_position_unavailable' end
         end
-        local matches=not kind.position_field or distance(up,np)<=NEAR2
+        local matches=not kind.position_field
+            or within(kind.type_hash,up,np)
         return {record=r,unit_position=up,network_position=np or up,kind=kind,pair_matches=matches}
     end
     function api.snapshot(requested_world)
@@ -2828,7 +2946,8 @@ return function(ot,profile)
         local unit_counts,id_counts={},{}
         for i,u in ipairs(valid) do
             for j,n in ipairs(valid) do
-                if n.kind.models[u.record.model_hash] and distance(u.unit_position,n.network_position)<=NEAR2 then
+                if n.kind.models[u.record.model_hash]
+                    and within(n.kind.type_hash,u.unit_position,n.network_position) then
                     unit_counts[i]=(unit_counts[i] or 0)+1;id_counts[j]=(id_counts[j] or 0)+1
                 end
             end
@@ -2973,6 +3092,16 @@ do
     end
     alias('51a0812e3bce2d74', '299c0d3dfd2f0994', 'content/fac_helldivers/hellpod/mortar_turret/mortar_turret_gas')
     alias('51a0812e3bce2d74', 'b2053a1838092f8b', 'content/fac_helldivers/hellpod/mortar_turret/mortar_turret_staticfield')
+    local function late_type(hash,call,rounds_slot,fields)
+        P.types[#P.types+1]={type_hash=hash,call=call,rounds_slot=rounds_slot,fields=fields}
+        return P.types[#P.types]
+    end
+    local t_17db8107=late_type('17db8107','!!!H[UA2',24,{'50ac6619','8bbeb160','20605662','2d27198c','98b4aaf0','c336a25c','3132608f','67526982','31182caf','49c250a6','31f86165','09d8bef4','c20428c6','6d1d5cfb','788b9753','99901914','1dd07f05','39d141d6','c3a3f66c','6f3ab277','4cbcc2a2','7030c54e','ec64918b','d7a5d63e','4a893e74','cd889dbc'})
+    local t_4e64c4dc=late_type('4e64c4dc','!!!:^yT5',31,{'50ac6619','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','6f3ab277','4cbcc2a2','7030c54e'})
+    local t_6d745627=late_type('6d745627','!!!yz6.F',31,{'50ac6619','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','6f3ab277','4cbcc2a2','7030c54e','cd889dbc'})
+    P.bindings[#P.bindings+1]={model_hash='2eecd0b1fa49630',type_hash=t_17db8107.type_hash,call=t_17db8107.call,fields=t_17db8107.fields}
+    P.bindings[#P.bindings+1]={model_hash='73681ffd58fa1a90',type_hash=t_4e64c4dc.type_hash,call=t_4e64c4dc.call,fields=t_4e64c4dc.fields,position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=3}
+    P.bindings[#P.bindings+1]={model_hash='9b2140378640432e',type_hash=t_6d745627.type_hash,call=t_6d745627.call,fields=t_6d745627.fields,position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=3}
     bind_all('29ae906ea485a7fa', 'content/fac_helldivers/hellpod/expandable_cover/expandable_cover')
     bind_all('2eecd0b1fa49630', 'content/fac_helldivers/equipment/support_weapons/grenade_launcher/grenade_launcher')
     bind_all('73681ffd58fa1a90', 'content/fac_helldivers/hellpod/ammo_rack_mounted_turret/ammo_rack_mounted_turret')
@@ -2980,14 +3109,8 @@ do
     bind_all('444880f62ca7eae8', 'content/fac_helldivers/vehicles/frv_heavy/armaments/frv_flamethrower/frv_flamethrower')
     P.models['9b2140378640432e']=true
     P.model_resources['9b2140378640432e']='content/fac_helldivers/vehicles/frv_supply/frv_supply'
-    local function late_type(hash,call,rounds_slot,fields)
-        P.types[#P.types+1]={type_hash=hash,call=call,rounds_slot=rounds_slot,fields=fields}
-        return P.types[#P.types]
-    end
-    local t_17db8107=late_type('17db8107','!!!H[UA2',24,{'50ac6619','8bbeb160','20605662','2d27198c','98b4aaf0','c336a25c','3132608f','67526982','31182caf','49c250a6','31f86165','09d8bef4','c20428c6','6d1d5cfb','788b9753','99901914','1dd07f05','39d141d6','c3a3f66c','6f3ab277','4cbcc2a2','7030c54e','ec64918b','d7a5d63e','4a893e74','cd889dbc'})
-    local t_4e64c4dc=late_type('4e64c4dc','!!!:^yT5',31,{'50ac6619','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','6f3ab277','4cbcc2a2','7030c54e'})
-    P.bindings[#P.bindings+1]={model_hash='2eecd0b1fa49630',type_hash=t_17db8107.type_hash,call=t_17db8107.call,fields=t_17db8107.fields}
-    P.bindings[#P.bindings+1]={model_hash='73681ffd58fa1a90',type_hash=t_4e64c4dc.type_hash,call=t_4e64c4dc.call,fields=t_4e64c4dc.fields,position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=3}
+    P.models['583ecde0d7718126']=true
+    P.model_resources['583ecde0d7718126']='content/fac_helldivers/hellpod/hellpod/hellpod'
 end
 
 local GROUPS={
@@ -3251,7 +3374,8 @@ return {
     },
     -- 墙上发射器的单位原点和墙根重合，全局 2.5 米会浮在 1.24 米高的墙上方一米多。
     -- 减到离墙顶约 0.65 米；再往下会陷进墙体，被深度缓冲挡住。
-    type_lift_delta={['17db8107']=-0.6,['4e64c4dc']=-1.75},
+    -- 补给车车体原点在车底，抬一米让标签落在车顶上方而不是车身里。
+    type_lift_delta={['17db8107']=-0.6,['4e64c4dc']=-1.75,['6d745627']=1.0},
 }
 
 end)()
@@ -3261,6 +3385,7 @@ local visual_settings
 local world=nil
 local tracked,records={},{}
 local now,sample_cursor,tracked_count=0,0,0
+local sample_fail_tick=0
 local SAMPLE_INTERVAL=0.05
 local next_sample_time,last_heavy_frame,last_clock_time=nil,nil,nil
 local heavy_samples,last_sample_time=0,nil
@@ -3305,6 +3430,7 @@ local function reset(next_world)
     world=next_world
     tracked,records={},{}
     sample_cursor,tracked_count=0,0
+    sample_fail_tick=0
     next_sample_time,last_sample_time=nil,nil
     camera_reason='not_sampled'
     cadence_reason=world and 'awaiting_sample' or 'no_world'
@@ -3359,13 +3485,31 @@ local function sample_ammo()
     -- network.sample always reads their current raw ammo again.
     if not updated or available~=true then clear_snapshot('identity_sample_incomplete');return false end
     local fresh={}
+    local status=nil
     sample_cursor=sample_cursor%#targets
+    local sampler=network and network.sample
     for i=1,#targets do
         local target=targets[(sample_cursor+i-1)%#targets+1]
-        local sampled,record=invoke('network.sample',network.sample,target.unit,target.model_hash)
-        if sampled and type(record)=='table' and record.verified==true then fresh[#fresh+1]=record end
+        -- invoke 只回传第一个返回值，采样失败的原因在第二个上，这里直接 pcall。
+        local ok,sampled,record=false,nil,nil
+        if type(sampler)=='function' then ok,sampled,record=pcall(sampler,target.unit,target.model_hash) end
+        if ok and sampled and type(record)=='table' and record.verified==true then
+            fresh[#fresh+1]=record
+            status=status or {}
+            status[#status+1]=target.model_hash..':ok'
+        else
+            -- 采样失败时 sample 只返回原因、不打日志，型号一多就完全看不到卡在哪。
+            status=status or {}
+            status[#status+1]=target.model_hash..':'..(ok and tostring(record) or 'call_error')
+        end
     end
     sample_cursor=(sample_cursor+1)%#targets
+    -- 20 Hz 采样，200 次约 10 秒。成功与失败都列出来，缺席的型号才看得见。
+    sample_fail_tick=sample_fail_tick+1
+    if sample_fail_tick>=200 then
+        sample_fail_tick=0
+        log('sample targets=%d ok=%d %s',#targets,#fresh,table.concat(status or {},' '))
+    end
     local captured,accepted=invoke('snapshot.capture',snapshot.capture,world,fresh)
     if not captured or accepted~=true then clear_snapshot('snapshot_capture_failed');return false end
     return true
@@ -3746,129 +3890,8 @@ local function scan_pos(session,id)
     return string.format('(%.2f,%.2f,%.2f)',x,y,z)
 end
 
--- 载具对象既没有位置字段、也没有可用的 schema 语义：把它的数值字段每三秒快照一次，
--- 只打变化的那些。开一炮或装填一次之后，动的那一列就是弹药。
--- 字段名按 32 位 hash 碰撞现造（PROBE_FIELDS），不依赖 object_info：自造类型名
--- 在那边取不到 schema。槽位号与 network_config 的字段表顺序一致。
-local PROBE_TYPES={['6a073cc6']=true}
-local PROBE_FIELDS={'!!!`/U/6','!!!e)IeZ','!!#VJJZx','!!!i{(EA','!!!C}i^T','!!!JucFY','!!!#N[n/','!!!&.2Kz','!!!]E{:C','!!$@=T8~','!!#p/p@7','!!#9f^Ab','!!#,lUr{','!!!.To01','!!!=CLvR','!!!Izno;','!!!+]UzV','!!#HQ!nm','!!!5n`qu','!!!Q-qm2','!!!X(n+O','!!!biZ(R','!!!]iO;x','!!!%u.HR','!!!tYOx0','!!!GHkVe','!!!0*uA(','!!!F;fU#','!!#Tasg9','!!!rZ?k,','!!!4)Z+O','!!!gWXLn','!!!,3xHD','!!!654zF','!!!(ra(-','!!!$7C#W','!!!#1Mot','!!!$0r$M','!!!98$m9','!!!rk[Sw','!!!5;8!d','!!!ERNq/','!!!8$gm=','!!!o]R=i','!!#I~`}:','!!!oQ@:A','!!#MveZu','!!!=Zkz2','!!!/r-3+','!!$B6BJ@','!!!(E.VZ','!!!0O5l_','!!!M<xfM','!!!K5(@a','!!!(z0*g','!!!C``6a','!!!P$/+C','!!!=7OfX','!!!;IOb7','!!$&Lsf0','!!!-8}&R','!!!A/{f(','!!!:)I=6','!!!?]3B*','!!$<!xLE','!!!o>Tkh','!!!@KQ@A','!!!C!n`G','!!!*GsbA','!!!S8;Da','!!#cK7[M','!!$_Gd>W','!!!)zP5q','!!!rWb7E','!!#8fIFy','!!$.dv4k','!!!DFLRh','!!#5r&CF','!!!7~Gkd','!!!M@4Lw','!!!qdjDW','!!!X-f>3','!!!!B^R-','!!#v8>-&'}
-local probe_next,probe_last,probe_seen=nil,{},{}
-local probe_names,probe_dumped={},{}
-
-local function probe_call(hash)
-    for i=1,#SCAN_HASH do
-        if SCAN_HASH[i]==hash then return SCAN_NAMES[i] end
-    end
-end
-
-local function probe_field_names(hash)
-    if probe_names[hash]~=nil then return probe_names[hash] or nil end
-    local Net=ot.engine.Network
-    local call=probe_call(hash)
-    local ok,info=false,nil
-    if call~=nil and type(Net)=='table' and type(Net.object_info)=='function' then
-        ok,info=pcall(Net.object_info,call)
-    end
-    local names=nil
-    if not probe_dumped[hash] then
-        probe_dumped[hash]=true
-        local keys={}
-        if type(info)=='table' then
-            for k in pairs(info) do keys[#keys+1]=tostring(k) end
-            table.sort(keys)
-        end
-        scan_log('SENTRY-INFO type=%s call=%s ok=%s keys=%s',hash,tostring(call),
-            tostring(ok),table.concat(keys,','))
-        local f=type(info)=='table' and info.fields or nil
-        if type(f)=='table' then
-            local n,parts=0,{}
-            for k,v in pairs(f) do
-                n=n+1
-                if n<=4 then
-                    parts[#parts+1]=string.format('%s:%s=%s:%s',type(k),tostring(k),type(v),tostring(v))
-                end
-            end
-            scan_log('SENTRY-INFO type=%s fields=%d sample=%s',hash,n,table.concat(parts,' | '))
-            local list={}
-            for k,v in pairs(f) do
-                if type(v)=='string' then list[#list+1]=v
-                elseif type(k)=='string' and type(v)=='number' then list[#list+1]=k end
-            end
-            if #list>0 then names=list end
-        end
-    end
-    probe_names[hash]=names or false
-    return names
-end
-
-local function probe_read(session,id,hash)
-    local GS=ot.engine.GameSession
-    probe_field_names(hash)          -- 顺带把 object_info 的形态打一次
-    local out={}
-    for i=1,#PROBE_FIELDS do
-        local got,value=pcall(GS.game_object_field,session,id,PROBE_FIELDS[i])
-        if got and type(value)=='number' then out[#out+1]={slot=i,value=value} end
-    end
-    if #out<1 then return nil,'no_numeric_fields' end
-    return out
-end
-
-local function probe_dump(key,rows)
-    -- 基线一次打完，字段多就分块，单行过长在日志里会被截断。
-    local chunk,parts,n=17,{},0
-    for i=1,#rows do
-        parts[#parts+1]=string.format('f%s=%s',rows[i].slot,tostring(rows[i].value))
-        if #parts==chunk or i==#rows then
-            n=n+1
-            scan_log('SENTRY-FIELD base goid=%s [%d] %s',key,n,table.concat(parts,' '))
-            parts={}
-        end
-    end
-end
-
-local function probe_tick(now)
-    if probe_next==nil then probe_next=now end
-    if now-probe_next<3 then return end
-    probe_next=now
-    if scan_session==nil then return end
-    for id,hash in pairs(scan_known) do
-        if PROBE_TYPES[hash] then
-            local key=tostring(id)
-            local ok,rows,why=pcall(probe_read,scan_session,id,hash)
-            if not ok then
-                scan_log('SENTRY-FIELD crash goid=%s',key)
-            elseif not rows then
-                if not probe_seen[key] then probe_seen[key]=true;scan_log('SENTRY-FIELD %s goid=%s',why,key) end
-            else
-                local prev=probe_last[key]
-                if prev==nil then
-                    local snap={}
-                    for i=1,#rows do snap[rows[i].slot]=rows[i].value end
-                    probe_last[key]=snap
-                    scan_log('SENTRY-FIELD goid=%s numeric_fields=%d',key,#rows)
-                    probe_dump(key,rows)
-                else
-                    local n=0
-                    for i=1,#rows do
-                        local r=rows[i]
-                        if prev[r.slot]~=nil and prev[r.slot]~=r.value and n<12 then
-                            n=n+1
-                            scan_log('SENTRY-FIELD diff goid=%s f%d value=%s was=%s',
-                                key,r.slot,tostring(r.value),tostring(prev[r.slot]))
-                        end
-                    end
-                    local snap={}
-                    for i=1,#rows do snap[rows[i].slot]=rows[i].value end
-                    probe_last[key]=snap
-                end
-            end
-        end
-    end
-end
-
 local function scan_tick(now)
     if scan_started==nil then scan_started=now end
-    probe_tick(now)
     if not scan_checked then
         scan_checked=true
         local Net=ot.engine.Network
@@ -3968,2994 +3991,6 @@ module.update=function(dt)
     return update_core(dt)
 end
 return module
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 

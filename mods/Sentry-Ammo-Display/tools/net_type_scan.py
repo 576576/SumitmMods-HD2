@@ -9,26 +9,7 @@
 扫出结果后按 goid 记住，后续轮次只补测新出现的对象。验证完即删。
 """
 
-# 载具类型 6a073cc6 的 84 个字段，按 32 位 hash 碰撞各造一个可打印名。
-# game_object_field 按名字算 hash 取字段，所以这些名字与真实字段名等价。
-PROBE_FIELD_NAMES = (
-    '!!!`/U/6', '!!!e)IeZ', '!!#VJJZx', '!!!i{(EA', '!!!C}i^T', '!!!JucFY',
-    '!!!#N[n/', '!!!&.2Kz', '!!!]E{:C', '!!$@=T8~', '!!#p/p@7', '!!#9f^Ab',
-    '!!#,lUr{', '!!!.To01', '!!!=CLvR', '!!!Izno;', '!!!+]UzV', '!!#HQ!nm',
-    '!!!5n`qu', '!!!Q-qm2', '!!!X(n+O', '!!!biZ(R', '!!!]iO;x', '!!!%u.HR',
-    '!!!tYOx0', '!!!GHkVe', '!!!0*uA(', '!!!F;fU#', '!!#Tasg9', '!!!rZ?k,',
-    '!!!4)Z+O', '!!!gWXLn', '!!!,3xHD', '!!!654zF', '!!!(ra(-', '!!!$7C#W',
-    '!!!#1Mot', '!!!$0r$M', '!!!98$m9', '!!!rk[Sw', '!!!5;8!d', '!!!ERNq/',
-    '!!!8$gm=', '!!!o]R=i', '!!#I~`}:', '!!!oQ@:A', '!!#MveZu', '!!!=Zkz2',
-    '!!!/r-3+', '!!$B6BJ@', '!!!(E.VZ', '!!!0O5l_', '!!!M<xfM', '!!!K5(@a',
-    '!!!(z0*g', '!!!C``6a', '!!!P$/+C', '!!!=7OfX', '!!!;IOb7', '!!$&Lsf0',
-    '!!!-8}&R', '!!!A/{f(', '!!!:)I=6', '!!!?]3B*', '!!$<!xLE', '!!!o>Tkh',
-    '!!!@KQ@A', '!!!C!n`G', '!!!*GsbA', '!!!S8;Da', '!!#cK7[M', '!!$_Gd>W',
-    '!!!)zP5q', '!!!rWb7E', '!!#8fIFy', '!!$.dv4k', '!!!DFLRh', '!!#5r&CF',
-    '!!!7~Gkd', '!!!M@4Lw', '!!!qdjDW', '!!!X-f>3', '!!!!B^R-', '!!#v8>-&',
-)
-
-_SCAN = r"""
+SCAN = r"""
 -- 诊断用：全类型扫描。前 SCAN_REAL 个是模组自带真名，其余由 32 位 hash 碰撞生成。
 local SCAN_NAMES={
     'zdZ~yhg!','Es}/~kND','i1j-1MHz','T[tD_-{~','N+d%Kq$1','4%EXhX(8',
@@ -253,129 +234,8 @@ local function scan_pos(session,id)
     return string.format('(%.2f,%.2f,%.2f)',x,y,z)
 end
 
--- 载具对象既没有位置字段、也没有可用的 schema 语义：把它的数值字段每三秒快照一次，
--- 只打变化的那些。开一炮或装填一次之后，动的那一列就是弹药。
--- 字段名按 32 位 hash 碰撞现造（PROBE_FIELDS），不依赖 object_info：自造类型名
--- 在那边取不到 schema。槽位号与 network_config 的字段表顺序一致。
-local PROBE_TYPES={['6a073cc6']=true}
-local PROBE_FIELDS={__PROBE_FIELDS__}
-local probe_next,probe_last,probe_seen=nil,{},{}
-local probe_names,probe_dumped={},{}
-
-local function probe_call(hash)
-    for i=1,#SCAN_HASH do
-        if SCAN_HASH[i]==hash then return SCAN_NAMES[i] end
-    end
-end
-
-local function probe_field_names(hash)
-    if probe_names[hash]~=nil then return probe_names[hash] or nil end
-    local Net=ot.engine.Network
-    local call=probe_call(hash)
-    local ok,info=false,nil
-    if call~=nil and type(Net)=='table' and type(Net.object_info)=='function' then
-        ok,info=pcall(Net.object_info,call)
-    end
-    local names=nil
-    if not probe_dumped[hash] then
-        probe_dumped[hash]=true
-        local keys={}
-        if type(info)=='table' then
-            for k in pairs(info) do keys[#keys+1]=tostring(k) end
-            table.sort(keys)
-        end
-        scan_log('SENTRY-INFO type=%s call=%s ok=%s keys=%s',hash,tostring(call),
-            tostring(ok),table.concat(keys,','))
-        local f=type(info)=='table' and info.fields or nil
-        if type(f)=='table' then
-            local n,parts=0,{}
-            for k,v in pairs(f) do
-                n=n+1
-                if n<=4 then
-                    parts[#parts+1]=string.format('%s:%s=%s:%s',type(k),tostring(k),type(v),tostring(v))
-                end
-            end
-            scan_log('SENTRY-INFO type=%s fields=%d sample=%s',hash,n,table.concat(parts,' | '))
-            local list={}
-            for k,v in pairs(f) do
-                if type(v)=='string' then list[#list+1]=v
-                elseif type(k)=='string' and type(v)=='number' then list[#list+1]=k end
-            end
-            if #list>0 then names=list end
-        end
-    end
-    probe_names[hash]=names or false
-    return names
-end
-
-local function probe_read(session,id,hash)
-    local GS=ot.engine.GameSession
-    probe_field_names(hash)          -- 顺带把 object_info 的形态打一次
-    local out={}
-    for i=1,#PROBE_FIELDS do
-        local got,value=pcall(GS.game_object_field,session,id,PROBE_FIELDS[i])
-        if got and type(value)=='number' then out[#out+1]={slot=i,value=value} end
-    end
-    if #out<1 then return nil,'no_numeric_fields' end
-    return out
-end
-
-local function probe_dump(key,rows)
-    -- 基线一次打完，字段多就分块，单行过长在日志里会被截断。
-    local chunk,parts,n=17,{},0
-    for i=1,#rows do
-        parts[#parts+1]=string.format('f%s=%s',rows[i].slot,tostring(rows[i].value))
-        if #parts==chunk or i==#rows then
-            n=n+1
-            scan_log('SENTRY-FIELD base goid=%s [%d] %s',key,n,table.concat(parts,' '))
-            parts={}
-        end
-    end
-end
-
-local function probe_tick(now)
-    if probe_next==nil then probe_next=now end
-    if now-probe_next<3 then return end
-    probe_next=now
-    if scan_session==nil then return end
-    for id,hash in pairs(scan_known) do
-        if PROBE_TYPES[hash] then
-            local key=tostring(id)
-            local ok,rows,why=pcall(probe_read,scan_session,id,hash)
-            if not ok then
-                scan_log('SENTRY-FIELD crash goid=%s',key)
-            elseif not rows then
-                if not probe_seen[key] then probe_seen[key]=true;scan_log('SENTRY-FIELD %s goid=%s',why,key) end
-            else
-                local prev=probe_last[key]
-                if prev==nil then
-                    local snap={}
-                    for i=1,#rows do snap[rows[i].slot]=rows[i].value end
-                    probe_last[key]=snap
-                    scan_log('SENTRY-FIELD goid=%s numeric_fields=%d',key,#rows)
-                    probe_dump(key,rows)
-                else
-                    local n=0
-                    for i=1,#rows do
-                        local r=rows[i]
-                        if prev[r.slot]~=nil and prev[r.slot]~=r.value and n<12 then
-                            n=n+1
-                            scan_log('SENTRY-FIELD diff goid=%s f%d value=%s was=%s',
-                                key,r.slot,tostring(r.value),tostring(prev[r.slot]))
-                        end
-                    end
-                    local snap={}
-                    for i=1,#rows do snap[rows[i].slot]=rows[i].value end
-                    probe_last[key]=snap
-                end
-            end
-        end
-    end
-end
-
 local function scan_tick(now)
     if scan_started==nil then scan_started=now end
-    probe_tick(now)
     if not scan_checked then
         scan_checked=true
         local Net=ot.engine.Network
@@ -466,7 +326,3 @@ local function scan_tick(now)
     end
 end
 """
-
-SCAN = _SCAN.replace(
-    "__PROBE_FIELDS__",
-    ",".join("'%s'" % n for n in PROBE_FIELD_NAMES))
