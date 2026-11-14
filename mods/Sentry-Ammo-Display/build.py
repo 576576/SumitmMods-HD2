@@ -52,6 +52,8 @@ GROUPS = (
      "e8c5d194-7b30-4f62-9a83-0d17b4e6c956"),
     ("supply", "武装补给", "补给舱 / 补给车",
      "f2a1c706-5d48-4b93-8e20-3c6a91d5b078"),
+    ("mounted", "移动阵地", "重机枪 FRV / 喷火 FRV",
+     "ded8fc28-b673-49b5-9c1d-ddb69aff9c48"),
 )
 
 M64 = 0xC6A4A7935BD1E995

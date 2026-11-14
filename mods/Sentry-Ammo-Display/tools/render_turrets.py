@@ -27,13 +27,18 @@ sys.path.insert(0, str(REPO / "toolchain" / "common"))
 import paths  # noqa: E402
 import bug_patch as bp  # noqa: E402
 import mine_patch as mp  # noqa: E402
+import glbskin  # noqa: E402
 import render_tiles as rt  # noqa: E402
 
 RAWPUMP = paths.RAWDUMP
 FILEDIVER = paths.FILEDIVER
 WORK = REPO / "build" / "_turrets"
 STRAT_ROOT = REPO / "build" / "_strat"
+GAME_DIR = Path("E:/SteamLibrary/steamapps/common/Helldivers 2")
 STRAT_DIR = STRAT_ROOT / "content" / "ui" / "shared" / "stratagem"
+# 没有纹理版的战备图标（E/GL-21、武装补给舱增强）由 make_icons.py 从 xaml 光栅化，
+# 与纹理版同格式，先在这里找，找不到再回落到原版纹理。
+ICONS_DIR = IMAGES / "icons"
 STRAT_ARCHIVE = "6a3eecfddce28fe8"
 STRAT_PATH = "content/ui/shared/stratagem/"
 TYPE_UNIT = "0xE0A48D0BE9A7453F"
@@ -46,37 +51,49 @@ BORDER = (42, 60, 82)
 
 Spec = namedtuple("Spec", "path shadow light clip")
 
+# 三辆 FRV 的整车与挂载件：补给型（补给架 + 自行炮塔）、普通型（重机枪）、重型型（喷火器）。
+FRV_MG_UNIT = "content/fac_helldivers/vehicles/frv/armaments/frv_mg/frv_mg"
+FRV_FLAME_UNIT = ("content/fac_helldivers/vehicles/frv_heavy/armaments/"
+                  "frv_flamethrower/frv_flamethrower")
+FRV_MG_CAR = "content/fac_helldivers/vehicles/frv/frv"
+FRV_FLAME_CAR = "content/fac_helldivers/vehicles/frv_heavy/frv_flamer"
+
 # 暗部 / 亮部两端：渲染出来是灰阶，按这两端做渐变映射上色。
-# 同一分组用相邻色相，组间拉开，保证一眼能分开。
+# 哨戒炮塔在游戏里是同一套军绿涂装，靠左侧图标区分型号；逐台换色会和图标对不上，
+# 也看不出它们属于同一族。
+TURRET_TINT = ((0.05, 0.24, 0.11), (0.48, 0.97, 0.62))
+# 可展开阵地的墙是工事钢板，不是炮塔，保持中性灰。
+WALL_TINT = ((0.22, 0.28, 0.36), (0.80, 0.88, 0.98))
+# 补给舱是冷灰的箱体，三辆 FRV 是冷蓝载具涂装。
+CRATE_TINT = ((0.20, 0.24, 0.31), (0.86, 0.92, 1.00))
+VEHICLE_TINT = ((0.05, 0.18, 0.36), (0.58, 0.88, 1.00))
+# 舱内的补给包是亮黄弹药箱，和罐体对比强烈，开口里才不是一片空腔。
+PACK_TINT = ((0.42, 0.31, 0.01), (1.00, 0.89, 0.22))
+
 SPECS = {
     "mg": Spec(PREFIX + "turret_machinegun_gpmg/turret_machinegun_gpmg",
-               (0.05, 0.22, 0.12), (0.46, 0.96, 0.66), None),
-    "gatling": Spec(PREFIX + "turret/turret",
-                    (0.36, 0.15, 0.03), (1.00, 0.64, 0.26), None),
-    "autocannon": Spec(PREFIX + "aa_turret/aa_turret",
-                       (0.36, 0.30, 0.05), (1.00, 0.97, 0.62), None),
-    "rocket": Spec(PREFIX + "rocket_turret/rocket_turret",
-                   (0.33, 0.11, 0.04), (1.00, 0.50, 0.30), None),
+               *TURRET_TINT, None),
+    "gatling": Spec(PREFIX + "turret/turret", *TURRET_TINT, None),
+    "autocannon": Spec(PREFIX + "aa_turret/aa_turret", *TURRET_TINT, None),
+    "rocket": Spec(PREFIX + "rocket_turret/rocket_turret", *TURRET_TINT, None),
     "flame": Spec(PREFIX + "flamethrower_turret/flamethrower_turret",
-                  (0.40, 0.07, 0.02), (1.00, 0.36, 0.08), None),
-    "mortar": Spec(PREFIX + "mortar_turret/mortar_turret",
-                   (0.24, 0.27, 0.31), (0.90, 0.93, 0.97), None),
+                  *TURRET_TINT, None),
+    "mortar": Spec(PREFIX + "mortar_turret/mortar_turret", *TURRET_TINT, None),
     "laser": Spec(PREFIX + "laser_cannon_turret/laser_cannon_turret",
-                  (0.34, 0.22, 0.02), (1.00, 0.78, 0.14), None),
-    "tesla": Spec(PREFIX + "tesla_turret/tesla_turret",
-                  (0.06, 0.30, 0.44), (0.50, 0.94, 1.00), None),
-    "hmg": Spec(PREFIX + "manned_turret/manned_turret",
-                (0.18, 0.27, 0.05), (0.70, 0.94, 0.34), None),
+                  *TURRET_TINT, None),
+    "tesla": Spec(PREFIX + "tesla_turret/tesla_turret", *TURRET_TINT, None),
+    "hmg": Spec(PREFIX + "manned_turret/manned_turret", *TURRET_TINT, None),
     "antitank": Spec(PREFIX + "antitank_emplacement/antitank_emplacement",
-                     (0.04, 0.27, 0.25), (0.40, 0.94, 0.86), None),
+                     *TURRET_TINT, None),
     # 可展开阵地的侧翼撑开后主体只剩一小块，只保留中间那一段。
-    "wall": Spec(PREFIX + "expandable_cover/expandable_cover",
-                 (0.22, 0.28, 0.36), (0.80, 0.88, 0.98), 0.12),
+    "wall": Spec(PREFIX + "expandable_cover/expandable_cover", *WALL_TINT, 0.12),
     # 补给类不是「炮塔」：本体是补给舱与补给车，炮塔挂上去另上色。
     "crate": Spec("content/fac_helldivers/hellpod/ammo_rack/ammo_rack",
-                  (0.20, 0.24, 0.31), (0.86, 0.92, 1.00), None),
+                  *CRATE_TINT, None),
     "car": Spec("content/fac_helldivers/vehicles/frv_supply/frv_supply",
-                (0.19, 0.23, 0.30), (0.84, 0.91, 1.00), None),
+                *VEHICLE_TINT, None),
+    "frvmg": Spec(FRV_MG_CAR, *VEHICLE_TINT, None),
+    "frvflame": Spec(FRV_FLAME_CAR, *VEHICLE_TINT, None),
 }
 
 # 榴弹兵墙的发射器是独立 unit：主 unit 里只有墙体和 attach_gun 座。
@@ -91,25 +108,22 @@ MAG_UNIT = ("content/fac_helldivers/equipment/attachment/magazine/"
 # 武装重新补给舱与补给型 FRV 共用这挺 AR-23 炮塔，只是挂点不同。
 TURRET_UNIT = ("content/fac_helldivers/hellpod/ammo_rack_mounted_turret/"
                "ammo_rack_mounted_turret")
-# 补给舱本体与舱内的弹药箱。舱体在游戏里是 deploy 动画控制的开合结构，
-# 只导出静态 unit 得到的是闭合态，侧面要自己开出口子。
+# 另外两辆 FRV 的挂载件：普通型的重机枪与重型型的喷火器，都装在同一个 gun_mount 上。
+# 补给舱本体。开舱形态不能从 gpu 拿（那份只有绑定姿态），
+# 要按 unit 自己的 deploy 动画求蒙皮，见 rack_open()。
 RACK_UNIT = "content/fac_helldivers/hellpod/ammo_rack/ammo_rack"
-CARGO_UNIT = "content/fac_helldivers/hellpod/ammo_rack/ammo_box"
-# 四个补给包与炮塔的挂点，取自 unit 骨骼 attach_01..04 / attach_top 的世界变换
-# （GLB 的节点矩阵累乘后换回 unit 坐标，高度减 0.957 对齐到罐体中心）。
-# 包是沿着 z 轴挂的，上下两排；attach_02/04 相对 01/03 绕竖轴转了 180°。
-CARGO_MOUNTS = (
-    ((0.0, 0.500, 0.301), 1.0),
-    ((0.0, -0.500, 0.301), -1.0),
-    ((0.0, 0.500, -0.277), 1.0),
-    ((0.0, -0.500, -0.238), -1.0),
-)
-TURRET_MOUNT = (0.0, 0.0, 0.862)
-# 侧面开口的范围：前后两侧各一个，覆盖上下两排补给包，只挖外壁。
-CARGO_WINDOWS = (90.0, 270.0)
-CARGO_HALF_ANGLE = 32.0
-CARGO_Z_RANGE = (-0.34, 0.62)
-CARGO_RADIUS = 0.42
+# 舱内的四只补给包，独立 unit，挂点是与舱体同名的骨骼 attach_01..04。
+PACK_UNIT = "content/fac_helldivers/hellpod/ammo_rack/ammo_box"
+PACK_BONES = ("attach_01", "attach_02", "attach_03", "attach_04")
+# 落地线：deploy 末帧外套筒沉到地面以下，绑定姿态的最低点是 0.09。
+# 舱体按这条线裁断，底下补一块封盖，底口半径取裁剪处外壳的实测值。
+RACK_GROUND = 0.09
+RACK_FLOOR_RADIUS = 0.545
+# 补给型 FRV 车斗上的补给架：unit 自带炮塔圆环，环顶中心在 (0, 0.043, 0.056)，
+# 挂到车身的 gun_mount 骨骼上就位。
+RACK_UNIT_FRV = ("content/fac_helldivers/vehicles/frv_supply/armaments/"
+                 "frv_supply_rack/frv_supply_rack")
+RACK_ANCHOR = (0.0, 0.043, 0.056)
 MOUNTS = {
     # wall: [(unit 路径, 挂点世界坐标, 对位点)]
     # 发射器挂在墙的 attach_gun 骨骼（世界平移 (0, -0.052, 1.253)，旋转为单位矩阵）。
@@ -119,28 +133,48 @@ MOUNTS = {
         (GL_UNIT, (0.0, -0.052, 1.253), (0.0, 0.0, 0.0)),
         (MAG_UNIT, (-0.023, 0.240, 1.399), (0.0, 0.0, 0.0)),
     ],
-    # 补给车货斗后段的 gun_mount 骨骼：世界 (x, y, z) = (0, -1.199, 1.083)，
-    # 就是炮塔的安装原点；货斗底板在 z=0.18，中间那截是炮塔自己的底座。
-    "car": [(TURRET_UNIT, (0.0, -1.199, 1.083), (0.0, 0.0, 0.0))],
+    # 三辆车的 gun_mount 在 GLB 里都是 (0, 1.646, 1.199)，但三辆车 unit 的原点
+    # 各不相同（包围盒中心不一样），换回 unit 坐标要按各自车身的包围盒对齐：
+    # GLB +y 是车高、+z 是车尾。
+    #   frv_supply  z -1.056..1.056  → (0, -1.227, 1.083)
+    #   frv         z -1.524..0.621  → (0, -1.275, 0.615)
+    #   frv_heavy   z -1.084..1.084  → (0, -1.475, 1.067)
+    "car": [
+        (RACK_UNIT_FRV, (0.0, -1.227, 1.083), RACK_ANCHOR),
+        (TURRET_UNIT, (0.0, -1.227, 1.083), (0.0, 0.0, 0.0)),
+    ],
+    # 重机枪与喷火器的原点在底座后方 —— 两个 unit 的 c_cradle_01 都在 y=0.555，
+    # 那是摇架（底座）中心，枪架就从这里向前伸。按原点对齐会整体前移半米，
+    # 落到车斗圆环的前缘之外。
+    "frvmg": [(FRV_MG_UNIT, (0.0, -1.275, 0.615), (0.0, 0.555, 0.0))],
+    "frvflame": [(FRV_FLAME_UNIT, (0.0, -1.475, 1.067), (0.0, 0.555, 0.0))],
 }
 
-# 挂载件单独配色，键是 MOUNTS 里的序号（1 = 发射器，2 = 弹链盒）。
+# 挂载件单独配色，键是 MOUNTS 里的序号（1 = 补给架/发射器，2 = 炮塔/弹链盒）。
 # 弹链盒是弹药箱，比掩体暗且偏黄铜；和墙用同一套灰就会连轮廓一起糊在墙顶豁口里。
-# 补给舱与补给车是冷灰的箱体/车身，炮塔染成暖金，一眼能看出显示的是哪一件。
+# 补给舱与补给车是冷灰的箱体/车身，只有炮塔染成暖金。
 SUPPLY_TINT = ((0.40, 0.19, 0.02), (1.00, 0.76, 0.30))
-# 舱内的弹药箱比罐体暖、比炮塔灰，夹在两者之间才分得清三层。
-CARGO_TINT = ((0.16, 0.20, 0.13), (0.60, 0.70, 0.46))
+# 车上挂的枪比车身亮一档，同色相，才不会和车斗糊成一块。
+GUN_TINT = ((0.10, 0.28, 0.50), (0.72, 0.94, 1.00))
 MOUNT_TINTS = {
     "wall": {2: ((0.22, 0.21, 0.16), (0.84, 0.79, 0.65))},
-    "crate": {1: CARGO_TINT, 2: SUPPLY_TINT},
-    "car": {1: SUPPLY_TINT},
+    "crate": {1: PACK_TINT, 2: SUPPLY_TINT},
+    "car": {2: SUPPLY_TINT},
+    "frvmg": {1: GUN_TINT},
+    "frvflame": {1: GUN_TINT},
 }
 
 # 载具与补给舱是大块薄壳，默认的半透明会把背面重叠面透出来，看着像缺件。
-SOLID_DEPTH = {"car": 0.40, "crate": 0.16}
+SOLID_DEPTH = {"car": 0.40, "crate": 0.16, "frvmg": 0.40, "frvflame": 0.40}
 
-# 补给车原朝向就能看清整车与炮塔，不需要再转。
-SPEC_YAW = {}
+# 三辆 FRV 的挂载件都在车斗后段，正面取景看不到，统一转半圈让车尾朝前。
+SPEC_YAW = {"car": 180.0, "frvmg": 180.0, "frvflame": 180.0}
+
+# 载具整车太占地方，炮塔与补给仓全在车尾：沿车长方向切掉前段，只留驾驶室后半与车斗。
+# 值是保留部分的 y 上限（unit 坐标，+y 是车头）。
+FRONT_CUT = 0.55
+# 需要切的车：三辆 FRV 的挂载件都在车尾。
+CUT_SPECS = {"car", "frvmg", "frvflame"}
 
 # 三种迫击共用同一个模型，靠游戏原版的战备图标区分。
 # 弹药显示左侧的单位图标取原版战备 HUD 图标；manned_flame 那个带人形，
@@ -167,7 +201,7 @@ def dump(game_dir):
     WORK.mkdir(parents=True, exist_ok=True)
     paths = sorted({spec.path for spec in SPECS.values()}
                    | {part[0] for parts in MOUNTS.values() for part in parts}
-                   | {RACK_UNIT, CARGO_UNIT})
+                   | {PACK_UNIT})
     for _ in range(2):
         if all((WORK / (stem_of(p) + ".main")).exists() for p in paths):
             break
@@ -271,6 +305,26 @@ def index_width(main, layout):
     return 2
 
 
+def visible_primary(main, primary, visible, bp):
+    """primary_meshes 之外再按材质去重：同一套材质的多个 LOD 只会列进来一半，
+    整车（frv）就会把两档 LOD 一起画出来，成了一堆互相穿插的三角面。
+
+    材质相同的候选里只留三角形最多的那一条；材质不同的（比如炮塔本体 + 底座）
+    照旧全部保留。
+    """
+    best = {}
+    for index, mesh in enumerate(bp.mesh_infos(main)):
+        if primary is not None and index not in primary:
+            continue
+        mats = frozenset(bp.mesh_materials(main, mesh))
+        if not (mats & visible):
+            continue
+        tris = sum(g[4] // 3 for g in bp.mesh_groups(main, mesh))
+        if mats not in best or tris > best[mats][1]:
+            best[mats] = (index, tris)
+    return {index for index, _ in best.values()}
+
+
 def unit_parts(stem, clip=None):
     """unit 里全部可见材质组，按 (mesh, group) 切开返回三角形列表。
 
@@ -287,11 +341,11 @@ def unit_parts(stem, clip=None):
     primary = rt.primary_meshes(main)
     layouts = bp.layout_blocks(main)
 
+    chosen = visible_primary(main, primary, visible, bp)
+
     parts = []
     for index, mesh in enumerate(bp.mesh_infos(main)):
-        if primary is not None and index not in primary:
-            continue
-        if not (set(bp.mesh_materials(main, mesh)) & visible):
+        if index not in chosen:
             continue
         layout = layouts[bp.mesh_layout(main, mesh)]
         items = bp.layout_items(main, layout)
@@ -593,44 +647,98 @@ def place(tris, matrix):
     return flat.reshape(tris.shape)
 
 
-def cargo_window(tris):
-    """侧面开口：只删三个顶点全落在窗口里的三角形，边缘留在原网格线上。
+def _to_unit(tris):
+    """glb 是 y 向上，unit 是 z 向上：绕 x 转 90° 再换轴。"""
+    return np.stack([tris[..., 0], -tris[..., 2], tris[..., 1]], axis=-1)
 
-    按三角形重心判会切出锯齿，按顶点判则保留模型自身的边框轮廓。
+
+Z_TO_Y = np.array([[1, 0, 0, 0], [0, 0, -1, 0], [0, 1, 0, 0], [0, 0, 0, 1]], float)
+
+
+def _unit_matrix(matrix):
+    """同一个换轴作用在矩阵上，让骨骼的位姿能直接摆 unit 坐标的几何。"""
+    return Z_TO_Y @ matrix @ Z_TO_Y.T
+
+
+def _floor_cap(radius, z, sides=48):
+    """把裁开的底口封成一块平盖：游戏里这一段埋在地下，见不到断面。"""
+    angle = np.linspace(0.0, 2.0 * math.pi, sides, endpoint=False)
+    ring = np.stack([radius * np.cos(angle), radius * np.sin(angle),
+                     np.full(sides, z)], axis=-1)
+    hub = np.repeat(np.array([[[0.0, 0.0, z]]]), sides, axis=0)
+    ahead = np.roll(ring, -1, axis=0)
+    return np.concatenate([hub, ring[:, None], ahead[:, None]], axis=1)
+
+
+def rack_open():
+    """补给舱开舱形态：外壳、门板、补给包一律取 unit 自己 deploy 动画的末帧。
+
+    导出的是蒙皮网格，unit 的 gpu 只有绑定姿态（未开舱），
+    所以这里带 --model-enable-animations 导 glb，按末帧求蒙皮。
+    补给包的挂点 attach_01..04 长在门板上，deploy 里门板外翻一百多度；
+    箱体本身是搁在舱内的，所以箱子取绑定姿态的挂点，跟着翻会躺倒并甩出舱外。
+    返回 (三角形, 四只补给包的变换矩阵, 炮塔挂点)，坐标系是 unit 的 z 向上。
     """
-    radius = np.hypot(tris[..., 0], tris[..., 1])
-    angle = np.arctan2(tris[..., 1], tris[..., 0])
-    z0, z1 = CARGO_Z_RANGE
-    base = (radius > CARGO_RADIUS) & (tris[..., 2] > z0) & (tris[..., 2] < z1)
-    sel = np.zeros(tris.shape[:2], bool)
-    for centre in CARGO_WINDOWS:
-        delta = np.abs((angle - math.radians(centre) + math.pi) % (2 * math.pi) - math.pi)
-        sel |= base & (delta < math.radians(CARGO_HALF_ANGLE))
-    return sel.all(axis=1)
+    folder = WORK / "_ammorack"
+    glb = folder / "combined_unit.combined.glb"
+    if not glb.is_file():
+        folder.mkdir(parents=True, exist_ok=True)
+        subprocess.run([str(FILEDIVER), "--gamedir", str(GAME_DIR), "-o", str(folder),
+                        "-i", "*ammo_rack/ammo_rack*", "--unit-single-file",
+                        "--model-format", "glb", "--model-enable-animations"], check=True)
+    gltf, blob = glbskin.load(glb)
+    anim = [i for i, a in enumerate(gltf["animations"]) if a["name"].endswith("/deploy")][0]
+    span = glbskin.duration(gltf, blob, anim)
+    pose = glbskin.Pose(gltf, blob, anim, span)
+    rest = glbskin.Pose(gltf, blob, None, 0.0)
+    tris = _to_unit(np.concatenate([v[tri] for v, tri, _ in
+                                    glbskin.skinned(gltf, blob, anim, span)]))
+    # 外套筒在 deploy 里沉到地面以下（游戏里埋进地里），只保留地面线上面的部分；
+    # 底口封一块平盖，免得断面透出空腔。
+    tris = tris[~(tris[..., 2] < RACK_GROUND).all(axis=1)]
+    tris[..., 2] = np.maximum(tris[..., 2], RACK_GROUND)
+    tris = np.concatenate([tris, _floor_cap(RACK_FLOOR_RADIUS, RACK_GROUND)])
+    packs = [_unit_matrix(rest.bone(name)) for name in PACK_BONES]
+    mount = _unit_matrix(pose.bone("attach_top"))[:3, 3]
+    return tris, packs, mount
+
+
+def rack_packs(packs):
+    """四只补给包按舱体的 attach_01..04 摆放（骨骼原点在包底面中心）。
+
+    骨骼空间是 y 向上、z 朝外，unit 几何是 z 向上、y 朝外，所以几何要先绕 x
+    转 90° 才进骨骼坐标系；不转的话箱子会躺倒、往舱外甩出半米。
+    """
+    box = turret_tris(stem_of(PACK_UNIT))
+    box = box - np.array([0.0, 0.0, box.reshape(-1, 3)[:, 2].min()])
+    return np.concatenate([place(box, matrix @ Z_TO_Y) for matrix in packs])
 
 
 def crate_assembly():
-    """装好补给的武装补给舱：侧面开两口，四个补给包挂在 attach_01..04，炮塔在 attach_top。
+    """武装补给舱：舱体取模型 deploy 末帧，补给包挂 attach_01..04，炮塔落 attach_top。
 
-    返回 (三角形, 组号)：0 罐体、1 补给包、2 炮塔。
+    返回 (三角形, 组号)：0 舱体、1 补给包、2 炮塔。
     """
-    body = turret_tris(stem_of(RACK_UNIT))
-    groups = [(body[~cargo_window(body)], 0)]
-
-    box = turret_tris(stem_of(CARGO_UNIT))
-    for (x, y, z), flip in CARGO_MOUNTS:
-        matrix = np.eye(4)
-        matrix[:3, :3] = np.diag([flip, flip, 1.0])
-        matrix[:3, 3] = (x, y, z)
-        groups.append((place(box, matrix), 1))
+    body, packs, mount = rack_open()
+    groups = [(body, 0), (rack_packs(packs), 1)]
 
     turret = np.eye(4)
-    turret[:3, 3] = TURRET_MOUNT
+    turret[:3, 3] = mount
     groups.append((place(turret_tris(stem_of(TURRET_UNIT)), turret), 2))
 
     tris = np.concatenate([t for t, _ in groups])
     tags = np.concatenate([np.full(len(t), g, np.uint8) for t, g in groups])
     return tris, tags
+
+
+def cut_front(tris, tags, limit):
+    """切掉 y 超过 limit 的三角形，只留车尾。
+
+    按三角形整条判：三个顶点都在切面之外的才删，切面处的边界留在原网格线上，
+    不会切出一圈悬空的半条三角形。
+    """
+    keep = ~(tris[..., 1] > limit).all(axis=1)
+    return tris[keep], (None if tags is None else tags[keep])
 
 
 def yaw_model(tris, degrees):
@@ -661,6 +769,9 @@ def render_all():
                 parts.append(part)
                 tags.append(np.full(len(part), index, np.uint8))
             tris, tags = np.concatenate(parts, axis=0), np.concatenate(tags)
+
+        if key in CUT_SPECS:
+            tris, tags = cut_front(tris, tags, FRONT_CUT)
 
         if key in SPEC_YAW:
             tris = yaw_model(tris, SPEC_YAW[key])
@@ -707,6 +818,12 @@ def base_span(art, band=0.18):
     if not len(cols):
         return 0, art.width - 1
     return int(cols[0]), int(cols[-1])
+
+
+def whole_span(art):
+    """按整幅外框的边缘排间距：车和舱这种大块实体不能按底座算，
+    车身比轮胎着地面宽，按底座排会让后一件压在车身上。"""
+    return 0, art.width - 1
 
 
 def scaled_by_base(path, base_px):
@@ -789,12 +906,21 @@ def _fill_holes(mask):
     return ~seen[1:-1, 1:-1]
 
 
+def icon_file(stem):
+    """图标文件：先找 tools/make_icons.py 生成的，再找原版纹理。"""
+    for base in (ICONS_DIR, STRAT_DIR):
+        path = base / (stem + ".png")
+        if path.is_file():
+            return path
+    raise SystemExit("缺少图标 %s" % stem)
+
+
 def unit_mark(stem, colour, flame=(0.96, 0.98, 1.00), size=0):
     """战备图标文件里的两路墨迹：红通道是本体，绿通道是火焰。
 
     本体填 colour、火焰填 flame（截图里火焰是白的），其余透明。
     """
-    src = Image.open(STRAT_DIR / (stem + ".png")).convert("RGB")
+    src = Image.open(icon_file(stem)).convert("RGB")
     arr = np.asarray(src, np.float32) / 255.0
     body = arr[..., 0] > 0.25
     glow = _fill_holes(arr[..., 1] > 0.25)
@@ -816,15 +942,15 @@ def unit_mark(stem, colour, flame=(0.96, 0.98, 1.00), size=0):
 
 def ammo_bar(rounds=760, capacity=900, segments=4, digit=76,
              icon=AMMO_ICON,
-             ink=(0.20, 0.85, 0.36)):
+             ink=(0.20, 0.85, 0.36), label=None):
     """游戏内的弹药显示：四角框只圈左侧单位图标，右侧大字与其下的分段横条。
 
     比例取自截图里火焰哨戒那一条（以数字高度为 1）：图标高 1.04、图标与数字
     间距 1.0、条长 1.18 且水平居中于数字、条高 0.14、数字与条间距 0.22、
-    段间为段宽的 0.29。
+    段间为段宽的 0.29。label 给定时用它代替数字（热量百分比、倒计时）。
     """
     font = hud_font(digit)
-    label = str(rounds)
+    label = str(rounds) if label is None else label
     probe = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
     box = probe.textbbox((0, 0), label, font=font, stroke_width=2)
     text_w, text_h = box[2] - box[0], box[3] - box[1]
@@ -1004,6 +1130,7 @@ def glow(img, cx, cy, radius, color):
 GROUP_ART = {
     "laser": ("laser",),
     "tesla": ("tesla",),
+    "mounted": ("frvmg", "frvflame"),
 }
 # 各组"一台炮塔"的目标高度（占图标边长的比例）。按整组外框缩放会让只有一台的组
 # 撑满、三台一排的组被压扁，按单台高度统一才有一致的视觉重量。
@@ -1014,6 +1141,7 @@ GROUP_MAIN = {
     "tesla": 0.56,
     "emplacement": 0.44,
     "supply": 0.56,
+    "mounted": 0.52,
 }
 GROUP_GLOW = {
     "ammo": (255, 122, 61),
@@ -1022,17 +1150,18 @@ GROUP_GLOW = {
     "tesla": (86, 214, 255),
     "emplacement": (110, 226, 196),
     "supply": (255, 186, 96),
+    "mounted": (128, 226, 255),
 }
 
 
-def rows_art(rows, gap, row_gap):
-    """逐行按底座边缘等间距排开，行内居中，行底边对齐。
+def rows_art(rows, gap, row_gap, span=base_span):
+    """逐行按 span 给出的边缘等间距排开，行内居中，行底边对齐。
 
     和封面底排同一套对齐方式：按底座边缘排间距，炮管探到邻座上方也不会显得挤。
     每行先单独画一条，再按实际像素框居中：按 layout_row 的累计宽度居中会被
     长炮管带偏，一行两台的组会整体偏到一侧。
     """
-    laid = [layout_row(arts, gap) for arts in rows]
+    laid = [layout_row(arts, gap, span) for arts in rows]
     strips = []
     for arts, w in laid:
         h = max(a.height for _, a in arts)
@@ -1095,8 +1224,15 @@ def group_art(key):
         # 左车右仓，按真实尺寸拉开差距：车长 4.68 m，补给舱直径 1.20 m、高 1.73 m。
         # 两者按同一高度摆，罐子会被画得比车还大。
         arts = [scaled(IMAGES / "model_car.png", 520),
-                scaled(IMAGES / "model_crate.png", 340)]
-        art = rows_art([arts], 60, 0)
+                scaled(IMAGES / "model_crate.png", 420)]
+        art = rows_art([arts], 50, 0, span=whole_span)
+        canvas = art
+        unit = max(a.height for a in arts)
+    elif key == "mounted":
+        # 两辆车并排，按整幅外框排间距：车身比轮胎着地面宽得多。
+        arts = [scaled(IMAGES / "model_frvmg.png", 500),
+                scaled(IMAGES / "model_frvflame.png", 500)]
+        art = rows_art([arts], 40, 0, span=whole_span)
         canvas = art
         unit = max(a.height for a in arts)
     else:
@@ -1129,6 +1265,44 @@ def group_icon(key, size=512, frame=True):
 # 预览图上排：五台实弹哨戒 + 激光，自动哨戒炮管横向最长，放最右边不挡别人。
 PREVIEW_TOP = ("mg", "gatling", "rocket", "flame", "laser", "autocannon")
 PREVIEW_MIDDLE = ("hmg", "antitank", "wall")
+# 第三排是补给舱与三辆 FRV，车尾的炮位就是显示位置。
+PREVIEW_MOUNTED = ("crate", "car", "frvmg", "frvflame")
+
+# 每个单位头顶的显示，参数与游戏内一致：单位图标、余量、容量、分段数、墨色、替代文本。
+# 炮塔与阵地一律绿色，载具一律蓝色；余量都取满弹，条长才是整条。
+AMMO_INK = (0.20, 0.85, 0.36)
+VEHICLE_INK = (0.28, 0.62, 1.00)
+BAR_SPECS = {
+    "mg": ("icon_strat_hud_defensive_turrets_machinegun", 150, 150, 4, AMMO_INK, None),
+    "gatling": ("icon_strat_hud_defensive_turrets_gatling", 1200, 1200, 6, AMMO_INK, None),
+    "rocket": ("icon_strat_hud_defensive_turrets_rocket", 24, 24, 4, AMMO_INK, None),
+    "flame": ("icon_strat_hud_flamethrower_turret", 400, 400, 4, AMMO_INK, None),
+    "laser": ("icon_strat_hud_laser_cannon_turret", 100, 100, 5, AMMO_INK, "100%"),
+    "autocannon": ("icon_strat_hud_defensive_turrets_autocannon", 60, 60, 4, AMMO_INK, None),
+    "mortar": ("icon_strat_hud_defensive_turrets_mortar", 12, 12, 4, AMMO_INK, None),
+    "mortar_gas": ("icon_strat_hud_defensive_turrets_mortar_gas", 12, 12, 4, AMMO_INK, None),
+    "mortar_ems": ("icon_strat_hud_defensive_turrets_mortar_staticfield", 12, 12, 4, AMMO_INK, None),
+    "tesla": ("icon_strat_hud_defensive_emplacements_teslatower", 60, 60, 4, AMMO_INK, "1:00"),
+    "hmg": ("icon_strat_hud_defensive_turrets_manned_machinegun", 150, 150, 5, AMMO_INK, None),
+    "antitank": ("icon_strat_hud_anti_tank_emplacement", 12, 12, 4, AMMO_INK, None),
+    # E/GL-21 没有纹理版图标，用 xaml 光栅化的那张；显示的是炮塔弹药，不是剩余补给。
+    "wall": ("wall", 24, 24, 4, AMMO_INK, None),
+    "crate": ("ammo_pod", 150, 150, 4, AMMO_INK, None),
+    "car": ("icon_strat_hud_vehicle_frv_supply", 150, 150, 4, VEHICLE_INK, None),
+    "frvmg": ("icon_strat_hud_vehicle_frv_hmg", 100, 100, 4, VEHICLE_INK, None),
+    "frvflame": ("icon_strat_hud_vehicle_frv_flamer", 800, 800, 4, VEHICLE_INK, None),
+}
+# 迫击炮三种型号竖排叠放，从上到下。
+MORTAR_BARS = ("mortar_gas", "mortar", "mortar_ems")
+
+
+def preview_bar(key, digit=24):
+    icon, rounds, capacity, segments, ink, label = BAR_SPECS[key]
+    bar = ammo_bar(rounds=rounds, capacity=capacity, segments=segments,
+                   digit=digit, icon=icon, ink=ink, label=label)
+    # 裁掉四周的透明留白，贴到模型顶边时才是真正的贴边，不会凭空多一截空隙
+    box = bar.getbbox()
+    return bar.crop(box) if box else bar
 
 
 def layout_row(arts, gap, span=base_span):
@@ -1146,55 +1320,95 @@ def layout_row(arts, gap, span=base_span):
     return [(x, art) for x, art in placed], width
 
 
-def preview():
-    """两排一字排开，底座间隙相等；不写战备编号，只留一条分隔线。
+def mortar_stack(row_h=186, pad=10):
+    """三种迫击炮的弹药条上下叠放，模型在下面，全部按底座中心对齐。
 
-    下排两端各是一列：三发弹在上、迫击炮在下，特斯拉塔与之等高；
-    中间三座阵地矮一档，全部底边对齐。
+    三型迫击共用同一个模型，靠弹药条上的单位图标区分（毒气 / 常规 / 电磁），
+    所以不再往炮身上叠效果符号。
     """
-    row_h, margin, sep = 190, 26, 46
+    bars = [preview_bar(key) for key in MORTAR_BARS]
+    art = scaled(IMAGES / "model_mortar.png", row_h)
+    base_l, base_r = base_span(art)
+    centre = (base_l + base_r) // 2
+    left = min(centre - b.width // 2 for b in bars)
+    right = max(centre + (b.width + 1) // 2 for b in bars)
+    art_left = centre - (base_l + base_r) // 2
+    left = min(left, art_left)
+    right = max(right, art_left + art.width)
+
+    height = sum(b.height for b in bars) + pad * (len(bars) - 1) + 12 + art.height
+    group = Image.new("RGBA", (right - left, height), CLEAR)
+    y = 0
+    for bar in bars:
+        group.alpha_composite(bar, (centre - bar.width // 2 - left, y))
+        y += bar.height + pad
+    group.alpha_composite(art, (centre - (base_l + base_r) // 2 - left,
+                                height - art.height))
+    return group
+
+
+def preview():
+    """三排一字排开，底座间隙相等；不写战备编号，只留分隔线。
+
+    中排两端各是一列：三发弹在上、迫击炮在下，特斯拉塔与之等高；
+    中间三座阵地矮一档，全部底边对齐。第三排是补给舱与三辆载具，
+    补给舱只有 1.73 m 高，按车辆的比例缩到相应大小。
+    每个单位头顶叠一条与游戏内同款的显示，位置按各自的底座中心算。
+    """
+    row_h, margin, sep = 190, 34, 46
 
     top = [scaled(IMAGES / ("model_%s.png" % key), row_h) for key in PREVIEW_TOP]
 
-    marks = [strat_mark(stem, colour, 58) for _, stem, colour in MORTARS]
-    mortar = scaled(IMAGES / "model_mortar.png", 186)
-    column_w = max(mortar.width, sum(m.width for m in marks))
-    column_h = marks[0].height + 14 + mortar.height
-    column = Image.new("RGBA", (column_w, column_h), CLEAR)
-    x = (column_w - sum(m.width for m in marks)) // 2
-    for mark in marks:
-        column.alpha_composite(mark, (x, 0))
-        x += mark.width
-    # 炮身不一定左右对称，按底座中心对位，弹列才会真正落在正上方
-    base_l, base_r = base_span(mortar)
-    column.alpha_composite(mortar, (column_w // 2 - (base_l + base_r) // 2,
-                                    column_h - mortar.height))
+    column = mortar_stack()
+    column_h = column.height
 
     tesla = scaled(IMAGES / "model_tesla.png", column_h)
-    bottom = ([column]
+    middle = ([column]
               + [scaled(IMAGES / ("model_%s.png" % key), row_h) for key in PREVIEW_MIDDLE]
               + [tesla])
+    # 补给舱按车高缩到 224：deploy 展开后模型比闭合态高一截，
+    # 同高摆会让露出的舱内部分缩得太小。
+    mounted = [scaled(IMAGES / ("model_%s.png" % key), 224 if key == "crate" else 232)
+               for key in PREVIEW_MOUNTED]
 
-    # 上排按底座排（炮管可以探到邻座上方），下排按整幅轮廓排，保证任何高度都不叠。
-    top_row, top_w = layout_row(top, 24)
-    bottom_row, bottom_w = layout_row(bottom, 18, span=full_span)
-    widest = max(top_w, bottom_w)
+    bars = {key: preview_bar(key) for key in BAR_SPECS}
+    chip_h = max(bar.height for bar in bars.values())
+
+    # 上排按底座排（炮管可以探到邻座上方），下面两排按整幅轮廓排，保证任何高度都不叠。
+    top_row, top_w = layout_row(top, 58)
+    mid_row, mid_w = layout_row(middle, 54, span=full_span)
+    mnt_row, mnt_w = layout_row(mounted, 40, span=whole_span)
+
+    widest = max(top_w, mid_w, mnt_w)
     width = widest + margin * 2
-    height = margin * 2 + row_h + sep + column_h
+    height = margin * 2 + chip_h + row_h + sep + chip_h + column_h + sep + chip_h + 208
     img = Image.new("RGB", (width, height), BG)
 
-    top_left = margin + (widest - top_w) // 2
-    for x, art in top_row:
-        img.paste(art, (x + top_left, margin + row_h - art.height), art)
+    top_base = margin + chip_h + row_h
+    mid_base = top_base + sep + chip_h + column_h
+    mnt_base = mid_base + sep + chip_h + 208
 
-    baseline = margin + row_h + sep + column_h
-    bottom_left = margin + (widest - bottom_w) // 2
-    for x, art in bottom_row:
-        img.paste(art, (x + bottom_left, baseline - art.height), art)
+    placed = []
+    for row, keys, baseline, total_w in ((top_row, PREVIEW_TOP, top_base, top_w),
+                                         (mid_row, (None,) + PREVIEW_MIDDLE + ("tesla",),
+                                          mid_base, mid_w),
+                                         (mnt_row, PREVIEW_MOUNTED, mnt_base, mnt_w)):
+        left = margin + (widest - total_w) // 2
+        for (x, art), key in zip(row, keys):
+            xy = (x + left, baseline - art.height)
+            img.paste(art, xy, art)
+            if key:
+                placed.append((key, xy, art))
+
+    for key, (px, py), art in placed:
+        bar = bars[key]
+        base_left, base_right = base_span(art)
+        cx = px + (base_left + base_right) // 2
+        img.paste(bar, (cx - bar.width // 2, py - bar.height - 5), bar)
 
     d = ImageDraw.Draw(img)
-    line_y = margin + row_h + sep // 2
-    d.line((margin, line_y, width - margin, line_y), fill=BORDER, width=2)
+    for y in (top_base + sep // 2, mid_base + sep // 2):
+        d.line((margin, y, width - margin, y), fill=BORDER, width=2)
     img.save(ROOT / "preview.png", optimize=True)
     print("preview:", ROOT / "preview.png")
 
@@ -1206,9 +1420,11 @@ def group_icons():
 
 
 def main():
+    global GAME_DIR
     parser = argparse.ArgumentParser()
-    parser.add_argument("--game-dir", default="E:/SteamLibrary/steamapps/common/Helldivers 2")
+    parser.add_argument("--game-dir", default=str(GAME_DIR))
     args = parser.parse_args()
+    GAME_DIR = Path(args.game_dir)
 
     dump(args.game_dir)
     dump_strat_icons(args.game_dir)

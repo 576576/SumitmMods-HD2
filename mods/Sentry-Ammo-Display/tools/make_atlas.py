@@ -17,6 +17,8 @@ from PIL import Image, ImageDraw
 
 ROOT = Path(__file__).resolve().parent.parent
 SOURCE = ROOT.parents[1] / "build" / "icons" / "content" / "ui" / "shared" / "stratagem"
+# 没有纹理版的图标（榴弹兵墙、武装补给舱）由 make_icons.py 光栅化，格式相同。
+LOCAL = ROOT / "images" / "icons"
 TARGET = ROOT / "images" / "icons_atlas.png"
 
 CELL = 128
@@ -49,12 +51,17 @@ CELLS = (
     (1, 2, "flamethrower_turret"),
     (2, 2, "laser_cannon_turret"),
     (3, 2, "defensive_emplacements_teslatower"),
+    # 这两个在游戏里没有纹理版，靠 xaml / svg 光栅化。
+    (1, 3, "wall"),
+    (2, 3, "ammo_pod"),
 )
 
 
 def composed(name):
     """图标 → RGBA，本体绿、符号浅灰、alpha 为两层并集。"""
-    path = SOURCE / ("icon_strat_hud_%s.png" % name)
+    path = LOCAL / ("%s.png" % name)
+    if not path.is_file():
+        path = SOURCE / ("icon_strat_hud_%s.png" % name)
     if not path.is_file():
         raise SystemExit("缺少图标 %s（先用 filediver 导出到 build/icons）" % path)
     src = Image.open(path).convert("RGB")

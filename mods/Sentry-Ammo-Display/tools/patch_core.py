@@ -104,6 +104,11 @@ WIDE = (
      "content/fac_helldivers/equipment/support_weapons/grenade_launcher/grenade_launcher"),
     ("73681ffd58fa1a90",
      "content/fac_helldivers/hellpod/ammo_rack_mounted_turret/ammo_rack_mounted_turret"),
+    ("085c1edb038ec24e",
+     "content/fac_helldivers/vehicles/frv/armaments/frv_mg/frv_mg"),
+    ("444880f62ca7eae8",
+     "content/fac_helldivers/vehicles/frv_heavy/armaments/"
+     "frv_flamethrower/frv_flamethrower"),
 )
 
 
@@ -115,6 +120,7 @@ local GROUPS={
     tesla={'74599e56f72f9d7e'},
     emplacement={'e977c49db7604f9','2b11c9e4980ec479','29ae906ea485a7fa','02eecd0b1fa49630'},
     supply={'73681ffd58fa1a90'},
+    mounted={'085c1edb038ec24e','444880f62ca7eae8'},
 }
 local groups_applied=false
 local function apply_groups()

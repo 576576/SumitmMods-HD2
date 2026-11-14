@@ -1,7 +1,7 @@
 {
   "Version": 1,
   "Guid": "7a75be80-edbd-49a1-befe-477043c4ef5d",
-  "Name": "炮塔阵地弹药显示 MDL3版 1.5.8",
+  "Name": "炮塔阵地弹药显示 MDL3版 1.5.11",
   "Description": "在炮塔与阵地的头顶显示弹药条、剩余发数、热量或部署倒计时，远处也能看清；字号、图标大小、条宽高、遮挡透明度等 14 项设置由 MDL3 保存。需要已安装 MDL3 dev.32 或更新版本。",
   "Options": [
     {
@@ -58,6 +58,14 @@
       "Image": "images/group_supply.png",
       "Include": [
         "groups/supply"
+      ]
+    },
+    {
+      "Name": "移动阵地（重机枪 FRV / 喷火 FRV）",
+      "Description": "显示重机枪 FRV / 喷火 FRV的头顶弹药。可与其他组同时勾选。",
+      "Image": "images/group_mounted.png",
+      "Include": [
+        "groups/mounted"
       ]
     }
   ],
