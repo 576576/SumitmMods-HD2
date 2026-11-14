@@ -38,9 +38,11 @@
 
 - `SENTRY-AMMO version=… build=…` 是第一行，记下模组版本与 profile 对应的游戏 build。
 - 状态行每 15 秒一条，其中 `network=` / `identity=` 是失败原因；`records=0` 表示没有采到任何炮塔。
-- `SENTRY-NETWORK` 与 `SENTRY-IDENTITY` 只在出错时出现，带具体位置，例如
-  `SENTRY-NETWORK bindings invalid_static_bindings bindings[57] model_missing model=2eecd0b1fa49630 type=3416fff4`。
-- `SENTRY-CENSUS <资源路径> units=N` 在首次查询时每个模型打一条，`units=0` 说明该模型在场上一个都没找到。
+- `SENTRY-NETWORK … sampled declared rounds_remaining; type=…` 表示某个网络类型第一次成功读到弹药，
+  每种类型只打一次；失败不打印。
 - `SENTRY-IDENTITY unbound model=… nearest_type=… distance=…` 表示这台单位找到了、但网络类型不在本模组认识的列表里；
   `no_network_objects` 则表示连对应的网络对象都没有。
+- `SENTRY-DRAW shown|drop_… model=… type=…` 每个型号每 10 秒一条。**某种型号完全没有 `SENTRY-DRAW` 行，
+  说明它没进快照，不是画不出来。**
+- `SENTRY-CENSUS <资源路径> units=N` 在计数变化时每个模型打一条，`units=0` 说明该模型在场上一个都没找到。
 - `SENTRY-API …` 在启动时打印引擎各模块暴露的接口名，用于核对可用能力。
