@@ -12,7 +12,7 @@
 ```
 toolchain/
 ├─ hd2tool/
-│  ├─ core.py       IDString64 / LZ4 block / DSAR / Stingray bundle / patch 重建 / 名表反查
+│  ├─ core.py       IDString64 / LZ4 block / DSAR / Stingray bundle / patch 重建 / 单 lua 归档 / 名表反查
 │  ├─ cli.py        命令行入口
 │  └─ __init__.py
 ├─ common/          共享库：paths / render_tiles / bug_patch / mine_patch（见 libs.md）

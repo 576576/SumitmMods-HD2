@@ -11,8 +11,8 @@ import sys
 from pathlib import Path
 
 from .core import (Bundle, DSAR, NameDB, DEFAULT_GAME_DIR, DEFAULT_NAMES_DIR,
-                   OUT_DIR, ROOT, hex64, idstring64, rebuild, resource_type_name,
-                   write_json)
+                   OUT_DIR, ROOT, build_lua_bundle, hex64, idstring64,
+                   read_lua_bundle, rebuild, resource_type_name, write_json)
 
 DEFAULT_OLD_PATCH = Path(
     "C:/Users/16695/Documents/Workbuddy Projects/hd2mods/Mines-Highlight/tools/source/9ba626afa44a3aa3.patch_2")
@@ -83,6 +83,22 @@ def cmd_selftest(args):
             for i in range(p.num_files)))
         ok &= same
         print("  %s rebuild round-trip: %d resources" % ("ok" if same else "FAIL", p.num_files))
+
+    sample = b"-- HD2-Addon: mods/selftest/x\nreturn 1\n"
+    built = build_lua_bundle("mods/selftest/x", sample)
+    rid, payload = read_lua_bundle(built)
+    entry = built[72:104]
+    shifted = built[:72] + b"\0" * 8 + entry[:-8] + built[104:]
+    try:
+        read_lua_bundle(shifted)
+        rejected = False
+    except ValueError:
+        rejected = True
+    layout = (rid == idstring64("mods/selftest/x") and payload == sample
+              and entry[8:16] == idstring64("lua").to_bytes(8, "little")
+              and entry[16:20] == b"\x01\0\0\0" and rejected)
+    ok &= layout
+    print("  %s 单 lua 归档：布局 / 读回 / 类型表错位被拒" % ("ok" if layout else "FAIL"))
 
     print("SELFTEST", "PASS" if ok else "FAIL")
     return 0 if ok else 1

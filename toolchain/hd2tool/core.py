@@ -32,6 +32,11 @@ TYPE_TEXTURE = "cd4238c6a0c69e32"
 TYPE_MATERIAL = "eac0b497876adedf"
 TYPE_BONES = "18dead01056b72e9"
 TYPE_UNIT = "e0a48d0be9a7453f"
+TYPE_LUA = "a14e8dfa2cd117e2"          # idstring64("lua")
+
+LUA_PAYLOAD_KIND = 2                    # lua 行载荷载荷前缀里的类型字段
+TYPE_ENTRY_HEAD = 8                     # 类型条目开头 8 字节在官方归档里恒为 0
+TYPE_ENTRY_UNIT = 16                    # 类型条目 +24 恒为 16，+28 为 16 × 类型数
 
 MASK64 = (1 << 64) - 1
 MIX = 0xC6A4A7935BD1E995
@@ -285,6 +290,86 @@ def rebuild(source: Bundle, indices: list[int], full_gpu: bool = False) -> tuple
     return bytes(main), bytes(gpu)
 
 
+def read_lua_bundle(main: bytes) -> tuple[int, bytes]:
+    """取出「单 lua 资源」归档里那一行：(资源 id, lua 文本)。
+
+    类型表 / 行表 / 载荷长度任一与规范布局不符就抛 ValueError —— 这样的归档游戏不认。
+    """
+    if len(main) < HEADER_SIZE + TYPE_ENTRY_SIZE + FILE_ENTRY_SIZE:
+        raise ValueError("归档只有 %d 字节，装不下头部与表" % len(main))
+    if struct.unpack_from("<I", main, 0)[0] != BUNDLE_MAGIC:
+        raise ValueError("不是 %#x 容器" % BUNDLE_MAGIC)
+    types, count = struct.unpack_from("<II", main, 4)
+    if types != 1 or count != 1:
+        raise ValueError("期望 1 条类型 / 1 行，实际 %d / %d" % (types, count))
+
+    entry = BUNDLE_TYPE.unpack_from(main, HEADER_SIZE)
+    if entry[0] or entry[1] or entry[4]:
+        raise ValueError("类型条目开头 8 字节与 +20 必须是 0：%s" % (entry,))
+    if entry[2] != idstring64("lua"):
+        raise ValueError("类型表里的类型不是 lua：%016x" % entry[2])
+    if entry[3] != 1 or entry[5] != TYPE_ENTRY_UNIT or entry[6] != TYPE_ENTRY_UNIT:
+        raise ValueError("类型条目计数/长度字段不对：count=%d unit=%d span=%d"
+                         % (entry[3], entry[5], entry[6]))
+
+    row = BUNDLE_FILE.unpack_from(main, HEADER_SIZE + TYPE_ENTRY_SIZE)
+    if not row[0]:
+        raise ValueError("行的资源 id 是 0")
+    if row[1] != entry[2]:
+        raise ValueError("行类型 %016x 与类型表 %016x 不一致" % (row[1], entry[2]))
+    offset, size = row[2], row[7]
+    if offset % 16 or offset < HEADER_SIZE + TYPE_ENTRY_SIZE + FILE_ENTRY_SIZE:
+        raise ValueError("载荷偏移 %d 未对齐或落在表内" % offset)
+    if offset + size > len(main):
+        raise ValueError("载荷 %d+%d 超出文件长度 %d" % (offset, size, len(main)))
+    if struct.unpack_from("<Q", main, 0x20)[0] != len(main):
+        raise ValueError("头部记录的文件长度与实际不符")
+
+    length, kind = struct.unpack_from("<II", main, offset)
+    if kind != LUA_PAYLOAD_KIND:
+        raise ValueError("载荷类型前缀是 %d，不是 lua" % kind)
+    if length + 8 != size:
+        raise ValueError("载荷声明 %d 字节，行记录 %d 字节" % (length, size))
+    return row[0], main[offset + 8:offset + 8 + length]
+
+
+def build_lua_bundle(module: str, source: bytes) -> bytes:
+    """生成只含一个 lua 资源的 patch_0，布局照游戏自身的归档。
+
+    72 字节头 + 1 条类型（开头 8 字节留 0、+8 类型 hash、+16 条数、+24 单条长度 16、
+    +28 合计 16×类型数）+ 1 行（行表紧跟类型表）+ 载荷（按 16 对齐）。
+
+    类型表若整体前移 8 字节，归档仍读得进来，但 lua 行没有对应类型条目，加载器不会执行它。
+    """
+    name = idstring64(module)
+    type_id = idstring64("lua")
+    files_base = HEADER_SIZE + TYPE_ENTRY_SIZE
+    data_base = align_up(files_base + FILE_ENTRY_SIZE, 16)
+    size = 8 + len(source)
+    total = data_base + size
+
+    main = bytearray(data_base)
+    struct.pack_into("<I", main, 0, BUNDLE_MAGIC)
+    struct.pack_into("<I", main, 4, 1)
+    struct.pack_into("<I", main, 8, 1)
+    struct.pack_into("<QQ", main, 0x20, total, 0)
+
+    struct.pack_into("<Q", main, HEADER_SIZE + 8, type_id)
+    struct.pack_into("<I", main, HEADER_SIZE + 16, 1)
+    struct.pack_into("<I", main, HEADER_SIZE + 24, TYPE_ENTRY_UNIT)
+    struct.pack_into("<I", main, HEADER_SIZE + 28, TYPE_ENTRY_UNIT)
+
+    BUNDLE_FILE.pack_into(main, files_base,
+                          name, type_id, data_base, 0, 0, 0, 0,
+                          size, 0, 0, TYPE_ENTRY_UNIT, TYPE_ENTRY_UNIT, 0)
+
+    out = bytes(main) + struct.pack("<II", len(source), LUA_PAYLOAD_KIND) + source
+    got_name, got_payload = read_lua_bundle(out)
+    if got_name != name or got_payload != source:
+        raise RuntimeError("生成的 lua 归档读回来与输入不一致")
+    return out
+
+
 class NameDB:
     """资源名反查表。hash 相同的名字会全部保留。"""
 
@@ -328,6 +413,7 @@ def resource_type_name(type_id: int, db: NameDB | None = None) -> str:
         int(TYPE_MATERIAL, 16): "material",
         int(TYPE_BONES, 16): "bones",
         int(TYPE_UNIT, 16): "unit",
+        int(TYPE_LUA, 16): "lua",
     }
     if type_id in known:
         return known[type_id]
