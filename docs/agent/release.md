@@ -18,6 +18,7 @@ python toolchain/release.py bump mines 1.0.2 --build # 升到指定版本并重�
 |---|---|---|---|---|---|
 | `mines` | `mods/Mines-Highlight` | Mines Highlight | — | `build.py` | `Mines-Highlight.zip` |
 | `sentry` | `mods/Sentry-Ammo-Display` | 炮塔阵地弹药显示 MDL3版 | — | `build.py` | `Sentry-Ammo-Display.zip` |
+| `armor` | `mods/Armor-Multi-Passive` | 护甲多被动 MDL3版 | — | `build.py`（内含 `tools/build_patch.py`） | `Armor-Multi-Passive.zip` |
 | `rs422` | `mods/RS-422-Railgun-Ultra` | RS-422 Railgun Ultra | `tools/bake_lua_patch.py` | `tools/build_lua_mod.py`、`tools/test_packages.py` | `RS-422-Railgun-Ultra.zip` |
 
 构建步骤以 mod 目录为 cwd 依次执行，任何一步非零退出就整体失败。

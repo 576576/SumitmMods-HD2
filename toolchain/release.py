@@ -38,6 +38,12 @@ PROJECTS = {
         "build": ["build.py"],
         "artifacts": ["Sentry-Ammo-Display.zip"],
     },
+    "armor": {
+        "dir": "mods/Armor-Multi-Passive",
+        "label": "护甲多被动",
+        "build": ["build.py"],
+        "artifacts": ["Armor-Multi-Passive.zip"],
+    },
     "rs422": {
         "dir": "mods/RS-422-Railgun-Ultra",
         "label": "RS-422 Railgun Ultra",
@@ -133,7 +139,8 @@ def bump_version(current, target):
 def cmd_bump(args):
     current = version_of(args.project)
     new = bump_version(current, args.version)
-    (project_dir(args.project) / "version.txt").write_text(new + "\n", encoding="utf-8")
+    (project_dir(args.project) / "version.txt").write_text(
+        new + "\n", encoding="utf-8", newline="")
     print("%s: %s -> %s" % (args.project, current, new))
     if args.build:
         cmd_build(args)

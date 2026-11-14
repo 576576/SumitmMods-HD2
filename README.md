@@ -8,6 +8,7 @@ Helldivers 2 的 mod 集合，单一仓库。共享的解析、渲染与发版�
 |---|---|---|
 | `mods/Mines-Highlight/` | 地雷高亮 | `dist/Mines-Highlight.zip` |
 | `mods/Sentry-Ammo-Display/` | 炮塔阵地弹药显示（MDL3） | `dist/Sentry-Ammo-Display.zip` |
+| `mods/Armor-Multi-Passive/` | 护甲多被动（MDL3 版，自选 32 项额外被动） | `dist/Armor-Multi-Passive.zip` |
 | `mods/RS-422-Railgun-Ultra/` | RS-422 Railgun Ultra（磁轨炮命中爆炸） | `dist/RS-422-Railgun-Ultra.zip` |
 
 玩法、安装与选项写在各自目录的 `README.md`。

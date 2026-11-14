@@ -1,0 +1,17 @@
+{
+  "Version": 1,
+  "Guid": "7b3e5d18-9a42-4c67-8f01-2d5b8e4a6c93",
+  "Name": "护甲多被动 MDL3版 1.8.1",
+  "Description": "F6 打开菜单自选额外护甲被动（32 项），空格勾选、F5 保存，按键可在 MDL3 的「按键绑定」里改（分类：军械工坊），也可在面板内按 F7 改。只写 data/game/generated_customization_passive_bonuses.dl_bin；首次运行自动备份游戏生成的原版，附带 Recovery 还原脚本。需要 MDL3 3.0.0-dev.33 或更新。",
+  "Options": [
+    {
+      "Name": "护甲多被动（MDL3）",
+      "Description": "纯 Lua 托管 addon。在 Arsenal 里启用本 mod，并把 MDL3 部署在最高优先级。",
+      "Image": "thumbnail.png",
+      "Include": [
+        "core"
+      ]
+    }
+  ],
+  "IconPath": "thumbnail.png"
+}

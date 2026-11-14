@@ -1,0 +1,9 @@
+*.lua text eol=lf
+*.txt text eol=lf
+*.md text eol=lf
+*.py text eol=lf
+*.ps1 text eol=lf
+*.bat text eol=crlf
+*.patch_0 binary
+*.gpu_resources binary
+*.stream binary
