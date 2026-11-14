@@ -36,6 +36,28 @@ return function(ot, profile, identity)
     local S=type(ot.engine)=='table' and ot.engine or {}
     local App,Unit,V3=S.Application or {},S.Unit or {},S.Vector3 or {}
     local Net,GS,US=S.Network or {},S.GameSession or {},S.UnitSynchronizer or {}
+    -- 诊断：把引擎各模块暴露的名字打一遍。网络类型名是混淆串，只能整串命中，
+    -- 先确认有没有「读对象类型」这类接口，省得靠猜。
+    if type(ot.log)=='function' then
+        local function names(t)
+            local list={}
+            if type(t)=='table' then
+                for key in pairs(t) do
+                    if type(key)=='string' then list[#list+1]=key end
+                end
+            end
+            table.sort(list)
+            return table.concat(list,',')
+        end
+        local function dump(label,t)
+            local ok,text=pcall(names,t)
+            pcall(ot.log,'SENTRY-API %s: %s',label,ok and text or 'unreadable')
+        end
+        dump('engine',S)
+        dump('Network',Net)
+        dump('GameSession',GS)
+        dump('UnitSynchronizer',US)
+    end
     local METRICS={
         ammo={field='rounds_remaining',hash='d7a5d63e',source='network.rounds_remaining'},
         heat={field='temperature',hash='a5023836',source='network.temperature'},
@@ -100,14 +122,18 @@ return function(ot, profile, identity)
         and type(US.game_object_id_to_unit)=='function'
     local types,types_by_hash,models={},{},profile.models
     local profile_problem=nil
+    -- 校验只给出一个错误码时，日志里看不出是哪一条出的问题，跟着补一条定位信息。
+    local profile_detail=nil
     if type(models)~='table' or type(profile.types)~='table'
         or #profile.types<1 or #profile.types>4096 then
         profile_problem='missing_network_profile'
+        profile_detail=string.format('models=%s types=%s',type(models),type(profile.types))
     else
         local seen={}
         for i=1,#profile.types do
             local entry=profile.types[i]
             local id=type(entry)=='table' and hash32(entry.type_hash)
+            profile_detail=string.format('types[%d] type_hash=%s',i,tostring(id))
             if not id or type(entry.call)~='string' or #entry.call<1
                 or #entry.call>128 or seen[id] then
                 profile_problem='invalid_network_profile'
@@ -158,10 +184,12 @@ return function(ot, profile, identity)
     -- Missing bindings disable this path only; a real native mapping can work
     -- without a coordinate-based association.
     local binding_types,binding_problem={},nil
+    local binding_detail=nil
     if type(profile.bindings)~='table' or #profile.bindings<1 or #profile.bindings>256 then
         binding_problem='static_bindings_unavailable'
+        binding_detail='bindings='..type(profile.bindings)
     else
-        for _,binding in ipairs(profile.bindings) do
+        for index,binding in ipairs(profile.bindings) do
             local mh=type(binding)=='table' and binding.model_hash
             if type(mh)=='string' then
                 mh=mh:lower():gsub('^0x','')
@@ -175,6 +203,14 @@ return function(ot, profile, identity)
             if not mh or type(models)~='table' or not models[mh] or not entry or binding.call~=entry.call
                 or type(binding.fields)~='table' or #binding.fields~=#entry.fields then
                 binding_problem='invalid_static_bindings'
+                local why='model_missing'
+                if not mh then why='model_hash_unparsable'
+                elseif not entry then why='type_missing'
+                elseif binding.call~=entry.call then why='call_mismatch'
+                elseif type(binding.fields)~='table' or #binding.fields~=#entry.fields then why='fields_length'
+                end
+                binding_detail=string.format('bindings[%d] %s model=%s type=%s',
+                    index,why,tostring(mh),tostring(id or binding.type_hash))
                 break
             end
             for slot=1,#entry.fields do
@@ -193,6 +229,8 @@ return function(ot, profile, identity)
         logged[key]=true
         if type(ot.log)=='function' then pcall(ot.log,'SENTRY-NETWORK %s',message) end
     end
+    if profile_problem then note('profile',profile_problem..' '..tostring(profile_detail)) end
+    if binding_problem then note('bindings',binding_problem..' '..tostring(binding_detail)) end
     -- Record the first native mapping calls in the loader's crash journal.
     -- A Lua pcall cannot catch native failures; a failed prior launch can skip
     -- this path on the next launch instead of repeating it.
@@ -393,6 +431,7 @@ return function(ot, profile, identity)
         return nil,row.next_type>#types and 'object_type_outside_profile' or 'discovering_object_type'
     end
     local api={}
+    local map_logged={}
     function api.reset(next_world)
         world=next_world
         call_detail=nil
@@ -434,7 +473,23 @@ return function(ot, profile, identity)
         local actual=name_ok and model_hash(name)
         if not actual then forget_unknown(unit);return fail('unit_model_unavailable') end
         if cache[unit] and cache[unit].model~=actual then forget(unit) end
+        if not map_logged[actual] then
+            map_logged[actual]=true
+            local where='unavailable'
+            local pose_ok,pose=pcall(Unit.world_position,unit,1)
+            if pose_ok and pose~=nil then
+                -- 注意：`a and pcall(...)` 只会返回一个值，必须分开写。
+                local xyz_ok,x,y,z=pcall(V3.to_elements,pose)
+                if xyz_ok and type(x)=='number' and type(y)=='number' and type(z)=='number' then
+                    where=string.format('(%.2f,%.2f,%.2f)',x,y,z)
+                end
+            end
+            pcall(ot.log,'SENTRY-MAP model=%s pos=%s',tostring(actual),where)
+        end
         if not models[actual] or actual~=expected_model then
+            if not models[actual] then
+                note('model:'..tostring(actual),'unit model not in profile: '..tostring(actual))
+            end
             forget_unknown(unit);return fail('unit_not_in_sentry_profile')
         end
         local goid,basis,fallback_kind
@@ -715,12 +770,14 @@ return function(ot,profile)
     local discovery_complete,discovery_reason,retained_count,new_count=false,'awaiting_discovery',0,0
     local validation_time,validation_frame=nil,nil
     local reason,problem='no_world',nil
+    local problem_detail=nil
     local budget_frame,checks,spent=nil,0,0
     local objects,unclassified,expired,bound,reclassified=0,0,0,0,0
     local candidate_count,nearest_distance,nearest_type,distance_frame=0,nil,nil,nil
     local nearest_unit_position,nearest_network_vector=nil,nil
     local types,models,by_type={},{},{}
     local all_types,active_types,scope_signature={}, {},nil
+    local diag_logged={}
     local age_limit,required_age,classification_rate=BASE_AGE,BASE_AGE,nil
     local rate_started,rate_last_time,rate_checks,sweep_seconds,oldest_negative_age=nil,nil,0,nil,0
     local throughput_limited=false
@@ -769,13 +826,17 @@ return function(ot,profile)
     if type(bindings)~='table' or #bindings<1 or #bindings>256 then
         problem='static_bindings_unavailable'
     else
-        for _,b in ipairs(bindings) do
+        for index,b in ipairs(bindings) do
             local mh=type(b)=='table' and hex(b.model_hash,16,false)
             local th=type(b)=='table' and hex(b.type_hash,8,true)
             if not mh or not th or type(b.call)~='string' or #b.call<1 or #b.call>128
                 or type(b.position_field)~='string' or #b.position_field<1 or #b.position_field>128
                 or type(b.fields)~='table' or #b.fields<1 or #b.fields>512
-                or not integer(b.position_slot,1,#b.fields) then problem='invalid_static_bindings';break end
+                or not integer(b.position_slot,1,#b.fields) then
+                problem='invalid_static_bindings'
+                problem_detail=string.format('bindings[%d] model=%s type=%s',index,tostring(mh),tostring(th))
+                break
+            end
             local fields={}
             for i=1,#b.fields do fields[i]=hex(b.fields[i],8,true) end
             local fields_valid=true
@@ -798,6 +859,9 @@ return function(ot,profile)
         end
     end
     all_types=types
+    if problem and type(ot.log)=='function' then
+        pcall(ot.log,'SENTRY-IDENTITY %s %s',problem,tostring(problem_detail))
+    end
     local function live_world()
         local ok,list=call(App.worlds)
         if not ok or type(list)~='table' then return nil end
@@ -1193,6 +1257,25 @@ return function(ot,profile)
                 end
             end
         end
+        -- 认不出来的模型打一次：最近的网络对象是什么类型、有多远。
+        if type(ot.log)=='function' then
+            for _,u in ipairs(units) do
+                if not choice[u.unit] and not diag_logged[u.model_hash] then
+                    local best,best2=nil,nil
+                    for _,c in ipairs(candidates) do
+                        local distance2=(u.x-c.x)^2+(u.y-c.y)^2+(u.z-c.z)^2
+                        if not best2 or distance2<best2 then best,best2=c,distance2 end
+                    end
+                    diag_logged[u.model_hash]=true
+                    if best then
+                        pcall(ot.log,'SENTRY-IDENTITY unbound model=%s nearest_type=%s distance=%.2f',
+                            u.model_hash,best.kind.type_hash,math.sqrt(best2))
+                    else
+                        pcall(ot.log,'SENTRY-IDENTITY unbound model=%s no_network_objects',u.model_hash)
+                    end
+                end
+            end
+        end
         for _,u in ipairs(units) do
             local p=established[u.unit]
             local c=p and candidate_by[p.goid] or choice[u.unit]
@@ -1279,6 +1362,7 @@ return function(ot,profile)
     local world,frame,cached=nil,nil,nil
     local reason='no_world'
     local queries,units_checked,target_count,elapsed_ms=0,0,0,0
+    local census_logged={}
     local complete=false
     local function finite(x)
         return type(x)=='number' and x==x and x>-math.huge and x<math.huge
@@ -1420,6 +1504,10 @@ return function(ot,profile)
                 if i%32==0 then
                     local allowed,why=measure();if not allowed then return fail(why) end
                 end
+            end
+            if type(ot.log)=='function' and not census_logged[resource.path] then
+                census_logged[resource.path]=true
+                pcall(ot.log,'SENTRY-CENSUS %s units=%d',resource.path,count)
             end
         end
         local allowed,why=measure()
@@ -2830,7 +2918,7 @@ return {
         ['2363e364']={u0=0.00390625,v0=0.25390625,u1=0.24609375,v1=0.49609375}, -- StratagemTurretsMortar
         ['3416fff4']={u0=0.25390625,v0=0.25390625,u1=0.49609375,v1=0.49609375}, -- StratagemTurretsMortarStaticfield
         ['3ae02f80']={u0=0.25390625,v0=0.50390625,u1=0.49609375,v1=0.74609375}, -- StratagemTurretFlamethrower
-        ['3bd04c18']={u0=0.25390625,v0=0.00390625,u1=0.49609375,v1=0.24609375}, -- StratagemEmplacementAntiTank
+        ['3bd04c18']={u0=0.25390625,v0=0.75390625,u1=0.49609375,v1=0.99609375}, -- StratagemEmplacementAntiTank
         ['3c709c50']={u0=0.75390625,v0=0.00390625,u1=0.99609375,v1=0.24609375}, -- StratagemTurretsGatling
         ['a37f0894']={u0=0.00390625,v0=0.50390625,u1=0.24609375,v1=0.74609375}, -- StratagemTurretsAutocannon
         ['be95e875']={u0=0.75390625,v0=0.25390625,u1=0.99609375,v1=0.49609375}, -- StratagemTurretsRocket
@@ -2965,7 +3053,7 @@ local function report()
     local ns,ls,ids,cs,ss=status_of(network),status_of(labels),status_of(identity),status_of(census),status_of(snapshot)
     local nr,lr,ir,cr=tostring(ns.reason),tostring(ls.reason),tostring(ids.reason),tostring(cs.reason)
     local signature=table.concat({world_reason,tostring(tracked_count),tostring(#records),nr,ir,camera_reason,lr,cr,tostring(ss.reason),cadence_reason},'|')
-    if now-last_status>=15 or (signature~=last_signature and now-last_status>=1) then
+    if now-last_status>=15 or (signature~=last_signature and now-last_status>=5) then
         log('tracked=%d records=%d network=%s identity=%s camera=%s labels=%s world=%s',
             tracked_count,#records,nr,ir,camera_reason,lr,world_reason)
         local sample_age=finite(ss.sample_time) and math.max(0,now-ss.sample_time) or nil
@@ -3037,7 +3125,8 @@ if ready then
     local settings_ok,value=invoke('settings.create',create_visual_settings,ot,labels,visual_profile)
     if settings_ok then visual_settings=value end
 end
-log('version=%s ready=%s; 20 Hz complete sampling, bounded 80 ms snapshots; game validation pending',VERSION,tostring(ready))
+log('version=%s build=%s ready=%s; 20 Hz complete sampling, bounded 80 ms snapshots; game validation pending',
+    VERSION,tostring(type(network_profile)=='table' and network_profile.steam_build),tostring(ready))
 return {
     version=VERSION,
     update=function(dt)

@@ -17,7 +17,9 @@ from PIL import Image, ImageDraw
 
 ROOT = Path(__file__).resolve().parent.parent
 SOURCE = ROOT.parents[1] / "build" / "icons" / "content" / "ui" / "shared" / "stratagem"
-# 没有纹理版的图标（榴弹兵墙、武装补给舱）由 make_icons.py 光栅化，格式相同。
+# 全量导出目录，含图标名表里没有的新债券图标（E/AT-12 等）。
+EXTRA = ROOT.parents[1] / "build" / "_strat" / "content" / "ui" / "shared" / "stratagem"
+# 没有纹理版的图标（武装补给舱）由 make_icons.py 光栅化，格式相同。
 LOCAL = ROOT / "images" / "icons"
 TARGET = ROOT / "images" / "icons_atlas.png"
 
@@ -53,8 +55,8 @@ CELLS = (
     (1, 2, "flamethrower_turret"),
     (2, 2, "laser_cannon_turret"),
     (3, 2, "defensive_emplacements_teslatower"),
-    # 这两个在游戏里没有纹理版，靠 xaml / svg 光栅化。
-    (1, 3, "wall"),
+    (1, 3, "anti_tank_emplacement"),
+    # 这个在游戏里没有纹理版，靠 xaml / svg 光栅化。
     (2, 3, "ammo_pod"),
 )
 
@@ -65,7 +67,9 @@ def composed(name):
     if not path.is_file():
         path = SOURCE / ("icon_strat_hud_%s.png" % name)
     if not path.is_file():
-        raise SystemExit("缺少图标 %s（先用 filediver 导出到 build/icons）" % path)
+        path = EXTRA / ("icon_strat_hud_%s.png" % name)
+    if not path.is_file():
+        raise SystemExit("缺少图标 %s（先用 filediver 导出到 build/icons 或 build/_strat）" % path)
     src = Image.open(path).convert("RGB")
     r, g, _ = src.split()
     body_ink, mark_ink = PALETTE.get(name, (BODY, SYMBOL))

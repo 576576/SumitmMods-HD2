@@ -8,9 +8,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT.parents[1] / "toolchain"))
 from hd2tool import idstring64  # noqa: E402
+from net_type_scan import SCAN as PROBE  # noqa: E402
 SOURCE = ROOT / "tools" / "source" / "e02b68d623c30acd.orig.lua"
 CORE = ROOT / "core" / "e02b68d623c30acd.lua"
-SLOT = 204_864          # 归档里这一行的总长度，与 patch_archive.GROW[CORE_ID] 同源
+SLOT = 224_000          # 归档里这一行的总长度，与 patch_archive.GROW[CORE_ID] 同源
 SOURCE_LIMIT = SLOT - 8
 
 OT = r'''local ot=(function()
@@ -29,6 +30,11 @@ local logfile=(function()
     return ok and file or nil
 end)()
 local t,f=0,0
+local function stamp()
+    if type(os_)~='table' or type(os_.date)~='function' then return '' end
+    local ok,value=pcall(os_.date,'%H:%M:%S')
+    return ok and type(value)=='string' and value..' ' or ''
+end
 return {
 engine=S,
 time=function() return t end,
@@ -36,12 +42,22 @@ frame=function() return f end,
 clock=function() return clock() end,
 risky=function(_,fn,...) return pcall(fn,...) end,
 log=function(text,...)
+    local ok,line=pcall(G.string.format,text,...)
+    if not ok then
+        -- 格式化失败时至少把参数拼上去，否则整行只剩模板。
+        local n=select('#',...)
+        if n<1 then line=tostring(text)
+        else
+            local parts={tostring(text)}
+            for i=1,n do parts[i+1]=tostring((select(i,...))) end
+            line=table.concat(parts,' ')
+        end
+    end
     if logfile then
-        local ok,line=pcall(G.string.format,text,...)
-        pcall(logfile.write,logfile,ok and line or tostring(text),'\n')
+        pcall(logfile.write,logfile,stamp(),line,'\n')
         pcall(logfile.flush,logfile)
     elseif type(G.print)=='function' then
-        pcall(G.print,'[Sentry Ammo]',text,...)
+        pcall(G.print,'[Sentry Ammo]',line)
     end
 end,
 options_menu=function()
@@ -62,6 +78,7 @@ local update_core=module.update
 module.update=function(dt)
     ot.advance(dt)
     apply_groups()
+    pcall(scan_tick,ot.time())
     return update_core(dt)
 end
 return module
@@ -326,7 +343,7 @@ def main():
     text = text.replace(anchor, "\nlocal module = {\n    version=VERSION,", 1)
     if not text.endswith("}\n"):
         raise SystemExit("文件末尾不是导出表的右括号")
-    text = text.rstrip("\n") + "\n" + TAIL
+    text = text.rstrip("\n") + "\n" + PROBE + TAIL
     expected = strip_comments(text)
 
     # 超长就从最长的一行纯注释开始删，代码骨架必须保持不变。
