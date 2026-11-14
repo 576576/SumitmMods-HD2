@@ -72,6 +72,11 @@ SPECS = {
     # 可展开阵地的侧翼撑开后主体只剩一小块，只保留中间那一段。
     "wall": Spec(PREFIX + "expandable_cover/expandable_cover",
                  (0.22, 0.28, 0.36), (0.80, 0.88, 0.98), 0.12),
+    # 补给类不是「炮塔」：本体是补给舱与补给车，炮塔挂上去另上色。
+    "crate": Spec("content/fac_helldivers/hellpod/ammo_rack/ammo_rack",
+                  (0.20, 0.24, 0.31), (0.86, 0.92, 1.00), None),
+    "car": Spec("content/fac_helldivers/vehicles/frv_supply/frv_supply",
+                (0.19, 0.23, 0.30), (0.84, 0.91, 1.00), None),
 }
 
 # 榴弹兵墙的发射器是独立 unit：主 unit 里只有墙体和 attach_gun 座。
@@ -80,9 +85,31 @@ SPECS = {
 # 没有第二套"墙专用发射器"模型 —— 墙上用的就是玩家那把 GL-21。
 GL_UNIT = ("content/fac_helldivers/equipment/support_weapons/"
            "grenade_launcher/grenade_launcher")
-# 弹链盒（方箱 + 露出的 10 发 40mm）只有这个包有，玩家武器包不带。
+# 弹链盒（方箱 + 拉直的一排 40mm）只有这个包有，玩家武器包不带。
 MAG_UNIT = ("content/fac_helldivers/equipment/attachment/magazine/"
             "grenade_launcher_ammo_box")
+# 武装重新补给舱与补给型 FRV 共用这挺 AR-23 炮塔，只是挂点不同。
+TURRET_UNIT = ("content/fac_helldivers/hellpod/ammo_rack_mounted_turret/"
+               "ammo_rack_mounted_turret")
+# 补给舱本体与舱内的弹药箱。舱体在游戏里是 deploy 动画控制的开合结构，
+# 只导出静态 unit 得到的是闭合态，侧面要自己开出口子。
+RACK_UNIT = "content/fac_helldivers/hellpod/ammo_rack/ammo_rack"
+CARGO_UNIT = "content/fac_helldivers/hellpod/ammo_rack/ammo_box"
+# 四个补给包与炮塔的挂点，取自 unit 骨骼 attach_01..04 / attach_top 的世界变换
+# （GLB 的节点矩阵累乘后换回 unit 坐标，高度减 0.957 对齐到罐体中心）。
+# 包是沿着 z 轴挂的，上下两排；attach_02/04 相对 01/03 绕竖轴转了 180°。
+CARGO_MOUNTS = (
+    ((0.0, 0.500, 0.301), 1.0),
+    ((0.0, -0.500, 0.301), -1.0),
+    ((0.0, 0.500, -0.277), 1.0),
+    ((0.0, -0.500, -0.238), -1.0),
+)
+TURRET_MOUNT = (0.0, 0.0, 0.862)
+# 侧面开口的范围：前后两侧各一个，覆盖上下两排补给包，只挖外壁。
+CARGO_WINDOWS = (90.0, 270.0)
+CARGO_HALF_ANGLE = 32.0
+CARGO_Z_RANGE = (-0.34, 0.62)
+CARGO_RADIUS = 0.42
 MOUNTS = {
     # wall: [(unit 路径, 挂点世界坐标, 对位点)]
     # 发射器挂在墙的 attach_gun 骨骼（世界平移 (0, -0.052, 1.253)，旋转为单位矩阵）。
@@ -92,13 +119,28 @@ MOUNTS = {
         (GL_UNIT, (0.0, -0.052, 1.253), (0.0, 0.0, 0.0)),
         (MAG_UNIT, (-0.023, 0.240, 1.399), (0.0, 0.0, 0.0)),
     ],
+    # 补给车货斗后段的 gun_mount 骨骼：世界 (x, y, z) = (0, -1.199, 1.083)，
+    # 就是炮塔的安装原点；货斗底板在 z=0.18，中间那截是炮塔自己的底座。
+    "car": [(TURRET_UNIT, (0.0, -1.199, 1.083), (0.0, 0.0, 0.0))],
 }
 
 # 挂载件单独配色，键是 MOUNTS 里的序号（1 = 发射器，2 = 弹链盒）。
 # 弹链盒是弹药箱，比掩体暗且偏黄铜；和墙用同一套灰就会连轮廓一起糊在墙顶豁口里。
+# 补给舱与补给车是冷灰的箱体/车身，炮塔染成暖金，一眼能看出显示的是哪一件。
+SUPPLY_TINT = ((0.40, 0.19, 0.02), (1.00, 0.76, 0.30))
+# 舱内的弹药箱比罐体暖、比炮塔灰，夹在两者之间才分得清三层。
+CARGO_TINT = ((0.16, 0.20, 0.13), (0.60, 0.70, 0.46))
 MOUNT_TINTS = {
     "wall": {2: ((0.22, 0.21, 0.16), (0.84, 0.79, 0.65))},
+    "crate": {1: CARGO_TINT, 2: SUPPLY_TINT},
+    "car": {1: SUPPLY_TINT},
 }
+
+# 载具与补给舱是大块薄壳，默认的半透明会把背面重叠面透出来，看着像缺件。
+SOLID_DEPTH = {"car": 0.40, "crate": 0.16}
+
+# 补给车原朝向就能看清整车与炮塔，不需要再转。
+SPEC_YAW = {}
 
 # 三种迫击共用同一个模型，靠游戏原版的战备图标区分。
 # 弹药显示左侧的单位图标取原版战备 HUD 图标；manned_flame 那个带人形，
@@ -124,7 +166,8 @@ def stem_of(path):
 def dump(game_dir):
     WORK.mkdir(parents=True, exist_ok=True)
     paths = sorted({spec.path for spec in SPECS.values()}
-                   | {part[0] for parts in MOUNTS.values() for part in parts})
+                   | {part[0] for parts in MOUNTS.values() for part in parts}
+                   | {RACK_UNIT, CARGO_UNIT})
     for _ in range(2):
         if all((WORK / (stem_of(p) + ".main")).exists() for p in paths):
             break
@@ -164,7 +207,8 @@ def dump_strat_icons(game_dir):
     """原版战备图标（256×256 方形）：红通道是本体，绿通道是效果符号。
 
     按名字哈希取文件而不是按名字匹配：部分战备（如 E/AT-12）的资源名还没被
-    名字表收录，按名字搜是空的，但哈希本身照样能命中。
+    名字表收录，按名字搜是空的，但哈希本身照样能命中。已知名字的图标会被写成
+    原名，未知名字的落成 0x<hash>.png，两种都要认。
     """
     wanted = [stem for _, stem, _ in MORTARS] + [AMMO_ICON, AT_ICON]
     missing = [stem for stem in wanted if not (STRAT_DIR / (stem + ".png")).exists()]
@@ -172,12 +216,14 @@ def dump_strat_icons(game_dir):
         return
     STRAT_ROOT.mkdir(parents=True, exist_ok=True)
     STRAT_DIR.mkdir(parents=True, exist_ok=True)
+    # 整个归档只有 688 张图：一次全导再按哈希挑，不必为每张图重读一遍元数据。
+    subprocess.run([str(FILEDIVER), "-g", str(game_dir), "--archives", STRAT_ARCHIVE,
+                    "-o", str(STRAT_ROOT), "--texture-format", "png"],
+                   check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     for stem in missing:
+        if (STRAT_DIR / (stem + ".png")).exists():
+            continue
         key = int.from_bytes(idstring64(STRAT_PATH + stem), "little")
-        subprocess.run([str(FILEDIVER), "-g", str(game_dir), "--archives", STRAT_ARCHIVE,
-                        "-i", "0x%016x*" % key, "-o", str(STRAT_ROOT),
-                        "--texture-format", "png"],
-                       check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         dumped = STRAT_ROOT / ("0x%016x.png" % key)
         if not dumped.exists():
             raise SystemExit("missing stratagem icon: " + stem)
@@ -216,12 +262,23 @@ def tint_model(image, shadow, light):
     return result
 
 
-def turret_tris(stem, clip=None):
-    """unit 里全部可见材质组拼成的三角形，不做高度过滤。
+def index_width(main, layout):
+    """索引位宽：顶点数超过 65535 的 mesh 用 u32，字节数除以索引条数即得。"""
+    count = bp.u32(main, layout + bp.LAYOUT_NUM_INDICES)
+    size = bp.u32(main, layout + bp.LAYOUT_INDICES_SIZE)
+    if count and size // count == 4:
+        return 4
+    return 2
 
-    渲染器原本用「高度超过中位数 4 倍就当光柱丢掉」来滤地雷的光柱。炮塔每台都是
-    「底座 + 支架」一组（高 1.78）+「武器」一组，机枪的武器只有 0.42 高，
-    4 倍阈值 1.68 就把底座那组当光柱删了，画出来只剩半截枪。
+
+def unit_parts(stem, clip=None):
+    """unit 里全部可见材质组，按 (mesh, group) 切开返回三角形列表。
+
+    不做高度过滤：炮塔的「底座 + 支架」一组高 1.78、武器一组只有 0.42，
+    按高度阈值滤光柱会把底座那组一起删掉，画出来只剩半截枪。
+
+    载具（FRV）的整车 mesh 顶点数过 65535，索引是 u32；一律按 u16 读会把
+    索引拆成两半，画出来是一团从中心放射的碎片。
     """
     main = (WORK / (stem + ".main")).read_bytes()
     gpu = (WORK / (stem + ".gpu")).read_bytes()
@@ -247,19 +304,25 @@ def turret_tris(stem, clip=None):
             raise SystemExit("unsupported position format %d" % fmt)
         block = np.frombuffer(gpu, dtype="<f4", count=count_v * stride // 4, offset=vbase)
         pos = block.reshape(count_v, stride // 4)[:, pos_at // 4: pos_at // 4 + 3]
-        for group in bp.mesh_groups(main, mesh):
+        width = index_width(main, layout)
+        dtype = "<u4" if width == 4 else "<u2"
+        for order, group in enumerate(bp.mesh_groups(main, mesh)):
             if group[4] < 3:
                 continue
-            idx = np.frombuffer(gpu, dtype="<u2", count=group[4], offset=ibase + group[3] * 2)
+            idx = np.frombuffer(gpu, dtype=dtype, count=group[4],
+                                offset=ibase + group[3] * width)
             idx = idx[:(group[4] // 3) * 3].reshape(-1, 3).astype(np.int32)
-            parts.append(pos[idx])
+            parts.append((index, order, pos[idx]))
     if not parts:
         raise SystemExit("unit has no visible triangles: %s" % stem)
-
-    tris = np.concatenate(parts, axis=0)
     if clip is not None:
-        tris = rt.clip_center(tris, clip)
-    return tris
+        parts = [(m, g, rt.clip_center(t, clip)) for m, g, t in parts]
+    return parts
+
+
+def turret_tris(stem, clip=None):
+    """unit 的全部可见三角形，按 (mesh, group) 合并成一个大数组。"""
+    return np.concatenate([t for _, _, t in unit_parts(stem, clip)], axis=0)
 
 
 def mount(tris, target, yaw=0.0, scale=1.0, anchor=None):
@@ -280,6 +343,28 @@ def mount(tris, target, yaw=0.0, scale=1.0, anchor=None):
         rot = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]], np.float32)
         v = v @ rot.T
     return (v + np.asarray(target, np.float32)).reshape(tris.shape)
+
+
+def coil_belt(tris, centre=(0.060, -0.210), radius=(0.032, 0.072)):
+    """把拉直的弹链绕竖直轴卷成一圈螺旋，塞进弹匣箱体里。
+
+    弹链盒 unit 的 1、2 组在模型里是沿 +X 拉直的 0.5 m 一排（链带 + 14 发 40mm），
+    直接画会像一条带子横在墙顶外面。按弧长把 X 卷成圆周、把原来的 z 偏量当作
+    径向厚度，弹体截面就不会被压扁。
+    """
+    flat = tris.reshape(-1, 3)
+    x0, x1 = float(flat[:, 0].min()), float(flat[:, 0].max())
+    length = max(x1 - x0, 1e-6)
+    r0, r1 = radius
+    u = (flat[:, 0] - x0) / length
+    # 半径线性增长时，角度按 ∫du·L/R(u) 累积，螺距才均匀。
+    pitch = max(r1 - r0, 1e-6)
+    theta = length / pitch * np.log((r0 + pitch * u) / r0)
+    radial = r0 + pitch * u + flat[:, 2]
+    out = flat.copy()
+    out[:, 0] = centre[0] + radial * np.cos(theta)
+    out[:, 2] = centre[1] + radial * np.sin(theta)
+    return out.reshape(tris.shape)
 
 
 def _components(mask):
@@ -420,10 +505,12 @@ def rasterize_var(sx, sy, depth, color, alpha, size, tags=None):
     return img, out_a, out_tag
 
 
-def render_tris(tris, frame=rt.FRAME, tags=None):
+def render_tris(tris, frame=rt.FRAME, tags=None, solid=0.0):
     """rt.render 的后半段，换成直接吃三角形数组。
 
     tags 给每个三角形标组号；给了就多返回灰度图和组号图，供挂载件单独上色。
+    solid 抬高不透明度：载具这种大块薄壳按默认半透明渲染会透出背面的重叠面，
+    看着像外壳缺了好几块。
     """
     tris = rt.transform(tris)
     size = rt.SUPERSAMPLE
@@ -445,12 +532,14 @@ def render_tris(tris, frame=rt.FRAME, tags=None):
     lum = np.clip(color[:, 0], 0.0, 1.0)
     front_tag = None if tags is None else tags[facing]
     back_tag = None if tags is None else tags[~facing]
+    front_alpha = np.clip(0.56 + 0.36 * lum[facing] + solid, 0.0, 1.0)
+    back_alpha = np.full(int((~facing).sum()), min(0.50 + solid * 0.8, 1.0))
     back_img, back_a, back_tag_map = rasterize_var(
         sx[~facing], sy[~facing], sz[~facing],
-        color[~facing] * 0.90, np.full((~facing).sum(), 0.50), size, back_tag)
+        color[~facing] * 0.90, back_alpha, size, back_tag)
     front_img, front_a, front_tag_map = rasterize_var(
         sx[facing], sy[facing], sz[facing],
-        color[facing], 0.56 + 0.36 * lum[facing], size, front_tag)
+        color[facing], front_alpha, size, front_tag)
     alpha = front_a + back_a * (1.0 - front_a)
     safe = np.maximum(alpha, 1e-6)[:, :, None]
     img = front_img * front_a[:, :, None] + back_img * back_a[:, :, None] * (1.0 - front_a)[:, :, None]
@@ -490,21 +579,94 @@ def retint(image, gray, tag_map, tag, shadow, light, alpha_gain=1.05):
     return Image.fromarray(np.clip(out, 0.0, 255.0).astype(np.uint8), "RGBA")
 
 
+def mag_part():
+    """弹链盒：0 组是箱体原样保留，1、2 组的弹链先卷进箱体。"""
+    parts = unit_parts(stem_of(MAG_UNIT))
+    box = [t for _, group, t in parts if group == 0]
+    belt = [t for _, group, t in parts if group != 0]
+    return np.concatenate([np.concatenate(box), coil_belt(np.concatenate(belt))], axis=0)
+
+
+def place(tris, matrix):
+    """按 4×4 矩阵摆放：挂点自带朝向，包和炮塔都要按骨骼的姿态落位。"""
+    flat = tris.reshape(-1, 3) @ matrix[:3, :3].T + matrix[:3, 3]
+    return flat.reshape(tris.shape)
+
+
+def cargo_window(tris):
+    """侧面开口：只删三个顶点全落在窗口里的三角形，边缘留在原网格线上。
+
+    按三角形重心判会切出锯齿，按顶点判则保留模型自身的边框轮廓。
+    """
+    radius = np.hypot(tris[..., 0], tris[..., 1])
+    angle = np.arctan2(tris[..., 1], tris[..., 0])
+    z0, z1 = CARGO_Z_RANGE
+    base = (radius > CARGO_RADIUS) & (tris[..., 2] > z0) & (tris[..., 2] < z1)
+    sel = np.zeros(tris.shape[:2], bool)
+    for centre in CARGO_WINDOWS:
+        delta = np.abs((angle - math.radians(centre) + math.pi) % (2 * math.pi) - math.pi)
+        sel |= base & (delta < math.radians(CARGO_HALF_ANGLE))
+    return sel.all(axis=1)
+
+
+def crate_assembly():
+    """装好补给的武装补给舱：侧面开两口，四个补给包挂在 attach_01..04，炮塔在 attach_top。
+
+    返回 (三角形, 组号)：0 罐体、1 补给包、2 炮塔。
+    """
+    body = turret_tris(stem_of(RACK_UNIT))
+    groups = [(body[~cargo_window(body)], 0)]
+
+    box = turret_tris(stem_of(CARGO_UNIT))
+    for (x, y, z), flip in CARGO_MOUNTS:
+        matrix = np.eye(4)
+        matrix[:3, :3] = np.diag([flip, flip, 1.0])
+        matrix[:3, 3] = (x, y, z)
+        groups.append((place(box, matrix), 1))
+
+    turret = np.eye(4)
+    turret[:3, 3] = TURRET_MOUNT
+    groups.append((place(turret_tris(stem_of(TURRET_UNIT)), turret), 2))
+
+    tris = np.concatenate([t for t, _ in groups])
+    tags = np.concatenate([np.full(len(t), g, np.uint8) for t, g in groups])
+    return tris, tags
+
+
+def yaw_model(tris, degrees):
+    """绕竖直轴转整台单位（挂载件已经并进同一份三角形，会一起转）。"""
+    v = tris.reshape(-1, 3).copy()
+    a = np.radians(degrees)
+    c, s = np.cos(a), np.sin(a)
+    x, y = v[:, 0].copy(), v[:, 1].copy()
+    v[:, 0] = c * x - s * y
+    v[:, 1] = s * x + c * y
+    return v.reshape(tris.shape)
+
+
 def render_all():
     IMAGES.mkdir(parents=True, exist_ok=True)
     for key, spec in SPECS.items():
-        tris = turret_tris(stem_of(spec.path), spec.clip)
-        tags = None
+        if key == "crate":
+            tris, tags = crate_assembly()
+        else:
+            tris = turret_tris(stem_of(spec.path), spec.clip)
+            tags = None
         if key in MOUNTS:
             parts = [tris]
             tags = [np.zeros(len(tris), np.uint8)]
             for index, (unit, target, anchor) in enumerate(MOUNTS[key], start=1):
-                part = mount(turret_tris(stem_of(unit)), target, anchor=anchor)
+                raw = mag_part() if unit == MAG_UNIT else turret_tris(stem_of(unit))
+                part = mount(raw, target, anchor=anchor)
                 parts.append(part)
                 tags.append(np.full(len(part), index, np.uint8))
             tris, tags = np.concatenate(parts, axis=0), np.concatenate(tags)
 
-        image, gray, tag_map = render_tris(tris, tags=tags)
+        if key in SPEC_YAW:
+            tris = yaw_model(tris, SPEC_YAW[key])
+
+        image, gray, tag_map = render_tris(tris, tags=tags,
+                                           solid=SOLID_DEPTH.get(key, 0.0))
         if key == "tesla":
             # 特斯拉没有弹匣：塔尖右侧挂电磁迫击那颗 2D 闪电，按放电而非弹药计量。
             image = bolt_overlay(image, MORTARS[2][1])
@@ -545,6 +707,22 @@ def base_span(art, band=0.18):
     if not len(cols):
         return 0, art.width - 1
     return int(cols[0]), int(cols[-1])
+
+
+def scaled_by_base(path, base_px):
+    """按底座宽度缩放。
+
+    实弹组五台共用同一个底座，渲染时按各自外框归一化，炮管越长底座显得越小；
+    统一按底座像素宽度缩放，摆在一起才是同一个基座。
+    """
+    image = Image.open(path).convert("RGBA")
+    box = image.getbbox()
+    if box:
+        image = image.crop(box)
+    left, right = base_span(image)
+    k = base_px / max(right - left + 1, 1)
+    return image.resize((max(1, round(image.width * k)), max(1, round(image.height * k))),
+                        Image.LANCZOS)
 
 
 def full_span(art):
@@ -826,7 +1004,6 @@ def glow(img, cx, cy, radius, color):
 GROUP_ART = {
     "laser": ("laser",),
     "tesla": ("tesla",),
-    "emplacement": ("hmg", "antitank", "wall"),
 }
 # 各组"一台炮塔"的目标高度（占图标边长的比例）。按整组外框缩放会让只有一台的组
 # 撑满、三台一排的组被压扁，按单台高度统一才有一致的视觉重量。
@@ -836,6 +1013,7 @@ GROUP_MAIN = {
     "laser": 0.50,
     "tesla": 0.56,
     "emplacement": 0.44,
+    "supply": 0.56,
 }
 GROUP_GLOW = {
     "ammo": (255, 122, 61),
@@ -843,11 +1021,38 @@ GROUP_GLOW = {
     "laser": (255, 196, 64),
     "tesla": (86, 214, 255),
     "emplacement": (110, 226, 196),
+    "supply": (255, 186, 96),
 }
 
 
+def rows_art(rows, gap, row_gap):
+    """逐行按底座边缘等间距排开，行内居中，行底边对齐。
+
+    和封面底排同一套对齐方式：按底座边缘排间距，炮管探到邻座上方也不会显得挤。
+    每行先单独画一条，再按实际像素框居中：按 layout_row 的累计宽度居中会被
+    长炮管带偏，一行两台的组会整体偏到一侧。
+    """
+    laid = [layout_row(arts, gap) for arts in rows]
+    strips = []
+    for arts, w in laid:
+        h = max(a.height for _, a in arts)
+        strip = Image.new("RGBA", (max(w, 1), h), CLEAR)
+        for x, art in arts:
+            strip.alpha_composite(art, (x, h - art.height))
+        strips.append(strip.crop(strip.getbbox()) if strip.getbbox() else strip)
+
+    width = max(s.width for s in strips)
+    height = sum(s.height for s in strips) + row_gap * (len(strips) - 1)
+    canvas = Image.new("RGBA", (width, height), CLEAR)
+    y = 0
+    for strip in strips:
+        canvas.alpha_composite(strip, ((width - strip.width) // 2, y))
+        y += strip.height + row_gap
+    return canvas
+
+
 def group_art(key):
-    """把本组元素摆到一张临时画布上，返回裁到内容框的整组图。
+    """把本组元素摆到一张临时画布上，返回裁到内容框的整组图与单台高度。
 
     每组元素个数从 1 台到 5 台不等，逐个按固定尺寸摆会让单台组撑满、
     多台组缩成一小团；这里只定元素间的相对大小，最后整组统一缩放居中。
@@ -861,7 +1066,6 @@ def group_art(key):
             canvas.alpha_composite(art, (x, y))
             x += art.width + gap
 
-    unit = 0
     if key == "mortar":
         # 三种迫击共用一个模型，靠原版战备图标的效果符号区分；符号排在炮身上方。
         marks = [strat_mark(stem, colour, 200) for _, stem, colour in MORTARS]
@@ -873,13 +1077,28 @@ def group_art(key):
         unit = art.height
         canvas.alpha_composite(art, ((width - art.width) // 2, marks[0].height + 50))
     elif key == "ammo":
-        top = [scaled(IMAGES / ("model_%s.png" % k), 540, by="area")
-               for k in ("autocannon", "flame", "rocket")]
-        row(top, 0, 16)
-        unit = max(a.height for a in top)
-        bottom = [scaled(IMAGES / ("model_%s.png" % k), 600, by="area")
-                  for k in ("mg", "gatling")]
-        row(bottom, max(a.height for a in top) - 40, 20)
+        base = 300
+        arts = {k: scaled_by_base(IMAGES / ("model_%s.png" % k), base)
+                for k in ("mg", "gatling", "autocannon", "rocket", "flame")}
+        art = rows_art([[arts["flame"], arts["rocket"]],
+                        [arts["mg"], arts["gatling"], arts["autocannon"]]],
+                       int(base * 0.50), int(base * 0.30))
+        canvas = art
+        unit = max(a.height for a in arts.values())
+    elif key == "emplacement":
+        arts = {k: scaled(IMAGES / ("model_%s.png" % k), 620, by="area")
+                for k in ("hmg", "antitank", "wall")}
+        art = rows_art([[arts["antitank"]], [arts["hmg"], arts["wall"]]], 120, 70)
+        canvas = art
+        unit = max(a.height for a in arts.values())
+    elif key == "supply":
+        # 左车右仓，按真实尺寸拉开差距：车长 4.68 m，补给舱直径 1.20 m、高 1.73 m。
+        # 两者按同一高度摆，罐子会被画得比车还大。
+        arts = [scaled(IMAGES / "model_car.png", 520),
+                scaled(IMAGES / "model_crate.png", 340)]
+        art = rows_art([arts], 60, 0)
+        canvas = art
+        unit = max(a.height for a in arts)
     else:
         arts = [scaled(IMAGES / ("model_%s.png" % k), 620, by="area") for k in GROUP_ART[key]]
         row(arts, 0, 20)

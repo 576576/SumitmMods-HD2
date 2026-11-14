@@ -2,9 +2,12 @@
 """从原始核心生成「自带 ot」版，并把长度压回归档里的原槽位。"""
 
 import re
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT.parents[1] / "toolchain"))
+from hd2tool import idstring64  # noqa: E402
 SOURCE = ROOT / "tools" / "source" / "e02b68d623c30acd.orig.lua"
 CORE = ROOT / "core" / "e02b68d623c30acd.lua"
 SLOT = 204_864          # 归档里这一行的总长度，与 patch_archive.GROW[CORE_ID] 同源
@@ -70,7 +73,7 @@ def norm_hash(value):
     return value.lower().lstrip("0") or "0"
 
 # census 逐项遍历模型清单做 unit 查询，上游按自己 9 个模型把上限定在 10。
-# 我们补了三条同族别名，运行时是 13 项，必须同步放宽，否则遍历到第 11 项就 break，
+# 这里补了同族别名与广撒网绑定，运行时是 15 项，必须同步放宽，否则遍历到第 11 项就 break，
 # 表现为 census complete=false / queries=0，一个单位都扫不到。
 CENSUS_LIMIT = 32
 CENSUS_LIMIT_OLD = "local MAX_TARGETS,MAX_RAW_UNITS,MAX_RESOURCES=128,128,10"
@@ -82,15 +85,25 @@ NEW_ADDON = "mods/sumitm/sentry_ammo_display/core"
 OLD_RESOURCE_PREFIX = "mods/codex/sentry_ammo/"
 NEW_RESOURCE_PREFIX = "mods/sumitm/sentry_ammo_display/"
 
-# 三类单位共用同族兄弟的字段布局：毒气/电磁迫击与普通迫击同型，榴弹兵墙与 HMG 阵地同型。
+# 三类单位共用同族兄弟的字段布局：毒气/电磁迫击与普通迫击同型。
 # 模型与资源名补进清单，schema 直接克隆兄弟那条，避免手写几十个字段哈希。
 ALIASES = (
-    ("e977c49db7604f9", "29ae906ea485a7fa",
-     "content/fac_helldivers/hellpod/expandable_cover/expandable_cover"),
     ("51a0812e3bce2d74", "299c0d3dfd2f0994",
      "content/fac_helldivers/hellpod/mortar_turret/mortar_turret_gas"),
     ("51a0812e3bce2d74", "b2053a1838092f8b",
      "content/fac_helldivers/hellpod/mortar_turret/mortar_turret_staticfield"),
+)
+
+# 这几种单位的网络类型在 1.4.6 的清单里没有：榴弹兵墙挂的是独立的榴弹发射器单位，
+# 武装补给舱与补给车共用一挺自行炮塔。清单里每条类型都试一遍，实际只会命中它自己的
+# 那一条——game_object_is_type 与 schema 校验会挡掉其余候选项。
+WIDE = (
+    ("29ae906ea485a7fa",
+     "content/fac_helldivers/hellpod/expandable_cover/expandable_cover"),
+    ("02eecd0b1fa49630",
+     "content/fac_helldivers/equipment/support_weapons/grenade_launcher/grenade_launcher"),
+    ("73681ffd58fa1a90",
+     "content/fac_helldivers/hellpod/ammo_rack_mounted_turret/ammo_rack_mounted_turret"),
 )
 
 
@@ -100,7 +113,8 @@ local GROUPS={
     mortar={'51a0812e3bce2d74','299c0d3dfd2f0994','b2053a1838092f8b'},
     laser={'56070f36cfffa8a8'},
     tesla={'74599e56f72f9d7e'},
-    emplacement={'e977c49db7604f9','2b11c9e4980ec479','29ae906ea485a7fa'},
+    emplacement={'e977c49db7604f9','2b11c9e4980ec479','29ae906ea485a7fa','02eecd0b1fa49630'},
+    supply={'73681ffd58fa1a90'},
 }
 local groups_applied=false
 local function apply_groups()
@@ -143,6 +157,26 @@ do
             ot.log('SENTRY-ALIAS no static binding for %s -> %s',base,path)
         end
     end
+    local function bind_all(new,path)
+        P.models[new]=true
+        P.model_resources[new]=path
+        local have,n={},0
+        for i=1,#P.bindings do have[P.bindings[i].type_hash]=true end
+        local count=#P.bindings
+        for i=1,count do
+            local b=P.bindings[i]
+            local t=b.type_hash
+            if have[t] then
+                have[t]=nil
+                local c={}
+                for k,v in pairs(b) do c[k]=v end
+                c.model_hash=new
+                P.bindings[#P.bindings+1]=c
+                n=n+1
+            end
+        end
+        ot.log('SENTRY-ALIAS wide %s -> %d types',path,n)
+    end
 """
 
 ALIAS_TAIL = "end\n"
@@ -152,6 +186,8 @@ def alias_block():
     lines = [ALIAS_HEAD]
     for base, new, path in ALIASES:
         lines.append("    alias('%s', '%s', '%s')\n" % (base, new, path))
+    for new, path in WIDE:
+        lines.append("    bind_all('%s', '%s')\n" % (new, path))
     lines.append(ALIAS_TAIL)
     return "".join(lines)
 
@@ -190,6 +226,14 @@ def check_profile_links(text):
     print("profile links:", len(keys), "models /", len(BINDING_ID_RE.findall(text)), "bindings")
 
 
+def check_wide_paths():
+    """WIDE 里的 id 必须是那条 unit 路径的哈希，资源查询按名字找，对不上就什么都查不到。"""
+    bad = ["%s <- %s" % (model, path) for model, path in WIDE
+           if norm_hash(model) != norm_hash("%016x" % idstring64(path))]
+    if bad:
+        raise SystemExit("WIDE 的模型 id 与路径哈希不符：%s" % ", ".join(bad))
+
+
 def strip_comments(source):
     """只留下代码骨架，用来确认删注释没有动到逻辑。"""
     out = []
@@ -217,12 +261,13 @@ def main():
         raise SystemExit("census 上限那行不是预期形态，清单结构可能已变")
     text = text.replace(CENSUS_LIMIT_OLD, CENSUS_LIMIT_NEW, 1)
 
-    total = len(profile_models(text)) + len(ALIASES)
+    total = len(profile_models(text)) + len(ALIASES) + len(WIDE)
     if total > CENSUS_LIMIT:
         raise SystemExit("模型数 %d 超过 census 上限 %d" % (total, CENSUS_LIMIT))
     print("census models:", total, "limit:", CENSUS_LIMIT)
 
     check_alias_bases(text)
+    check_wide_paths()
 
     if OLD_ADDON not in text:
         raise SystemExit("核心里的 addon 名不是预期的 %s" % OLD_ADDON)
@@ -236,7 +281,7 @@ def main():
     start = text.index(marker)
     close = text.index("\nend)()\n", start) + len("\nend)()\n")
     text = text[:close] + alias_block() + GROUPS + text[close:]
-    print("aliased models:", len(ALIASES))
+    print("aliased models:", len(ALIASES), "wide bindings:", len(WIDE))
     print("group filter:", "apply_groups" in text)
     check_profile_links(text)
 

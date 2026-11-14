@@ -50,6 +50,8 @@ GROUPS = (
      "d6f0b273-9c14-4a58-b309-71e2c5a8d045"),
     ("emplacement", "阵地", "重机枪 / 反坦克 / 榴弹兵墙",
      "e8c5d194-7b30-4f62-9a83-0d17b4e6c956"),
+    ("supply", "武装补给", "补给舱 / 补给车",
+     "f2a1c706-5d48-4b93-8e20-3c6a91d5b078"),
 )
 
 M64 = 0xC6A4A7935BD1E995
@@ -127,7 +129,8 @@ def stamp_version():
 
 
 def build_payloads():
-    for script in ("patch_core.py", "patch_archive.py"):
+    # patch_archive 会整包重写归档，图集切片必须在那之后再写回去。
+    for script in ("patch_core.py", "patch_archive.py", "patch_atlas.py"):
         subprocess.run([sys.executable, str(ROOT / "tools" / script)], check=True)
 
 
