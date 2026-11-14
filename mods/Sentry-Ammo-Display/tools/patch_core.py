@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """从原始核心生成「自带 ot」版，并把长度压回归档里的原槽位。"""
 
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SOURCE = ROOT / "tools" / "source" / "e02b68d623c30acd.orig.lua"
 CORE = ROOT / "core" / "e02b68d623c30acd.lua"
-SLOT = 204_800          # 归档里这一行的总长度（现在由我们重排 TOC，可自行放大）
+SLOT = 204_864          # 归档里这一行的总长度，与 patch_archive.GROW[CORE_ID] 同源
 SOURCE_LIMIT = SLOT - 8
 
 OT = r'''local ot=(function()
@@ -21,7 +22,7 @@ local logfile=(function()
         local ok,value=pcall(os_.getenv,'LOCALAPPDATA')
         if ok and type(value)=='string' then dir=value..'\\' end
     end
-    local ok,file=pcall(G.io.open,dir..'SentryAmmoOverhead.log','w')
+    local ok,file=pcall(G.io.open,dir..'SentryAmmoDisplay.log','w')
     return ok and file or nil
 end)()
 local t,f=0,0
@@ -63,14 +64,28 @@ end
 return module
 '''
 
-# 原版清单里 HMG 阵地的 id 少了一个前导 0，永远匹配不上；先修这个再谈别的。
-BROKEN_MANNED_ID = "'e977c49db7604f9'"
-FIXED_MANNED_ID = "'0e977c49db7604f9'"
+# 核心在查表前会 gsub('^0+','') 去掉前导零，所以 models 的键与 binding 的 model_hash
+# 都必须写成去零后的形态；带前导零的键永远查不到。
+def norm_hash(value):
+    return value.lower().lstrip("0") or "0"
+
+# census 逐项遍历模型清单做 unit 查询，上游按自己 9 个模型把上限定在 10。
+# 我们补了三条同族别名，运行时是 13 项，必须同步放宽，否则遍历到第 11 项就 break，
+# 表现为 census complete=false / queries=0，一个单位都扫不到。
+CENSUS_LIMIT = 32
+CENSUS_LIMIT_OLD = "local MAX_TARGETS,MAX_RAW_UNITS,MAX_RESOURCES=128,128,10"
+CENSUS_LIMIT_NEW = "local MAX_TARGETS,MAX_RAW_UNITS,MAX_RESOURCES=128,128,%d" % CENSUS_LIMIT
+
+# 资源名换成本仓库的命名空间（与 patch_archive.py 的行标签 / 哈希替换必须一致）。
+OLD_ADDON = "mods/codex/sentry_ammo_overhead"
+NEW_ADDON = "mods/sumitm/sentry_ammo_display/core"
+OLD_RESOURCE_PREFIX = "mods/codex/sentry_ammo/"
+NEW_RESOURCE_PREFIX = "mods/sumitm/sentry_ammo_display/"
 
 # 三类单位共用同族兄弟的字段布局：毒气/电磁迫击与普通迫击同型，榴弹兵墙与 HMG 阵地同型。
 # 模型与资源名补进清单，schema 直接克隆兄弟那条，避免手写几十个字段哈希。
 ALIASES = (
-    ("0e977c49db7604f9", "29ae906ea485a7fa",
+    ("e977c49db7604f9", "29ae906ea485a7fa",
      "content/fac_helldivers/hellpod/expandable_cover/expandable_cover"),
     ("51a0812e3bce2d74", "299c0d3dfd2f0994",
      "content/fac_helldivers/hellpod/mortar_turret/mortar_turret_gas"),
@@ -85,7 +100,7 @@ local GROUPS={
     mortar={'51a0812e3bce2d74','299c0d3dfd2f0994','b2053a1838092f8b'},
     laser={'56070f36cfffa8a8'},
     tesla={'74599e56f72f9d7e'},
-    emplacement={'0e977c49db7604f9','2b11c9e4980ec479','29ae906ea485a7fa'},
+    emplacement={'e977c49db7604f9','2b11c9e4980ec479','29ae906ea485a7fa'},
 }
 local groups_applied=false
 local function apply_groups()
@@ -104,23 +119,29 @@ local function apply_groups()
 end
 '''
 
+# 模型→类型映射在 profile.bindings 里，types 只有类型 schema、不带 model_hash。
+# 同一模型可能对应多条 binding（多个候选 schema），必须全部克隆，只留第一条会少掉观测路径。
+# 找不到基准只跳过：单条缺失不该让整个插件在 MDL3 里加载失败。
 ALIAS_HEAD = """
 do
     local P=network_profile
     local function alias(base,new,path)
         P.models[new]=true
         P.model_resources[new]=path
-        for i=1,#P.types do
-            local e=P.types[i]
-            if e.model_hash==base then
+        local n=0
+        for i=1,#P.bindings do
+            local b=P.bindings[i]
+            if b.model_hash==base then
                 local c={}
-                for k,v in pairs(e) do c[k]=v end
+                for k,v in pairs(b) do c[k]=v end
                 c.model_hash=new
-                P.types[#P.types+1]=c
-                return
+                P.bindings[#P.bindings+1]=c
+                n=n+1
             end
         end
-        error('alias base not found: '..base)
+        if n==0 then
+            ot.log('SENTRY-ALIAS no static binding for %s -> %s',base,path)
+        end
     end
 """
 
@@ -134,6 +155,39 @@ def alias_block():
     lines.append(ALIAS_TAIL)
     return "".join(lines)
 
+
+BINDING_ID_RE = re.compile(r"model_hash='([0-9a-f]{8,16})'")
+
+
+def profile_models(text):
+    """清单里的模型 id；census 的上限约束的就是这个数量。"""
+    m = re.search(r"model_resources\s*=\s*\{(.*?)\n    \}", text, re.S) or \
+        re.search(r"model_resources\s*=\s*\{(.*?)\}", text, re.S)
+    return set(re.findall(r"\['([0-9a-f]{8,16})'\]", m.group(1))) if m else set()
+
+
+def check_alias_bases(text):
+    """别名基准必须真的在 profile 的 bindings 里，数据重生成换了 id 就在构建期报错。"""
+    present = set(BINDING_ID_RE.findall(text))
+    missing = [base for base, _, _ in ALIASES if base not in present]
+    if missing:
+        raise SystemExit("alias base missing from profile bindings: %s" % ", ".join(missing))
+    taken = [new for _, new, _ in ALIASES if new in present]
+    if taken:
+        raise SystemExit("alias target already bound: %s" % ", ".join(taken))
+
+
+def check_profile_links(text):
+    """每条 binding 的 model_hash 去零后必须能命中 models 的键。
+
+    核心解析 profile 时先用 gsub('^0+','') 归一化再查 models，键里带前导零就永远查不到，
+    一条不中整表判 invalid_static_bindings，表现为所有炮塔都不显示。
+    """
+    keys = {norm_hash(k) for k in profile_models(text)}
+    bad = sorted({m for m in BINDING_ID_RE.findall(text) if norm_hash(m) not in keys})
+    if bad:
+        raise SystemExit("binding 的 model_hash 不在 models 清单里：%s" % ", ".join(bad))
+    print("profile links:", len(keys), "models /", len(BINDING_ID_RE.findall(text)), "bindings")
 
 
 def strip_comments(source):
@@ -153,11 +207,30 @@ def main():
 
     text = text.replace("local ot=...\n", OT, 1)
 
-    if BROKEN_MANNED_ID not in text:
-        raise SystemExit("找不到 HMG 阵地那条残缺 id，清单可能已变")
-    fixed = text.count(BROKEN_MANNED_ID)
-    text = text.replace(BROKEN_MANNED_ID, FIXED_MANNED_ID)
-    print("fixed manned id occurrences:", fixed)
+    version = (ROOT / "version.txt").read_text(encoding="utf-8").strip()
+    stamp = re.search(r"^local VERSION='[^']*'$", text, re.M)
+    if not stamp:
+        raise SystemExit("找不到 VERSION 常量")
+    text = text[:stamp.start()] + "local VERSION='%s'" % version + text[stamp.end():]
+
+    if text.count(CENSUS_LIMIT_OLD) != 1:
+        raise SystemExit("census 上限那行不是预期形态，清单结构可能已变")
+    text = text.replace(CENSUS_LIMIT_OLD, CENSUS_LIMIT_NEW, 1)
+
+    total = len(profile_models(text)) + len(ALIASES)
+    if total > CENSUS_LIMIT:
+        raise SystemExit("模型数 %d 超过 census 上限 %d" % (total, CENSUS_LIMIT))
+    print("census models:", total, "limit:", CENSUS_LIMIT)
+
+    check_alias_bases(text)
+
+    if OLD_ADDON not in text:
+        raise SystemExit("核心里的 addon 名不是预期的 %s" % OLD_ADDON)
+    text = text.replace(OLD_ADDON, NEW_ADDON)
+    if OLD_RESOURCE_PREFIX in text:
+        text = text.replace(OLD_RESOURCE_PREFIX, NEW_RESOURCE_PREFIX)
+    if "mods/codex/" in text:
+        raise SystemExit("核心 lua 里还有上游的命名空间")
 
     marker = "local network_profile = (function()"
     start = text.index(marker)
@@ -165,6 +238,7 @@ def main():
     text = text[:close] + alias_block() + GROUPS + text[close:]
     print("aliased models:", len(ALIASES))
     print("group filter:", "apply_groups" in text)
+    check_profile_links(text)
 
     anchor = "\nreturn {\n    version=VERSION,"
     if text.count(anchor) != 1:

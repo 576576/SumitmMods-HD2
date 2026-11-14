@@ -1,6 +1,6 @@
--- HD2-Addon: mods/codex/sentry_ammo_mdl_adapter
+-- HD2-Addon: mods/sumitm/sentry_ammo_display/mdl_adapter
 -- MDL3 入口：直接 require 弹药核心。不含加载器、不扫描归档、不代管其他加载器。
-local RESOURCE = 'mods/codex/sentry_ammo_overhead'
+local RESOURCE = 'mods/sumitm/sentry_ammo_display/core'
 local MAX_ERRORS = 20
 
 local module, enabled, errors = nil, false, 0
@@ -39,20 +39,29 @@ function definition.on_enable()
     say('core '..tostring(value.version)..' attached through MDL3')
 end
 
-function definition.on_update(_, dt)
-    if not enabled or not module then return end
-    local ok, err = pcall(module.update, dt)
-    if ok then return end
+-- MDL3 的 addon 契约只给 on_update，没有 on_render：采样走 update，
+-- 画标签必须每帧再调一次 core 的 render，否则一条都不画。
+local function fail(err, what)
     errors = errors + 1
-    if errors <= 3 then say('update error: '..tostring(err)) end
-    if errors < MAX_ERRORS then return end
-    -- 连续报错就自己停掉，别拖累 MDL3 的其他插件。
+    if errors <= 3 then say(what..' error: '..tostring(err)) end
+    return errors >= MAX_ERRORS
+end
+local function stop()
     enabled = false
     local failed = module
     module = nil
     pcall(failed.shutdown)
     definition.status = 'stopped'
     say('stopped after '..errors..' update errors')
+end
+
+function definition.on_update(_, dt)
+    if not enabled or not module then return end
+    local ok, err = pcall(module.update, dt)
+    if not ok and fail(err, 'update') then return stop() end
+    -- render 失败同样要计数：渲染回调出错时继续采样只会空转。
+    local drawn, draw_err = pcall(module.render)
+    if not drawn and fail(draw_err, 'render') then return stop() end
 end
 
 function definition.on_disable()

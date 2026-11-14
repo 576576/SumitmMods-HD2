@@ -11,6 +11,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 DIST = ROOT.parents[1] / "dist"
+sys.path.insert(0, str(ROOT.parents[1] / "toolchain"))
+from hd2tool import build_lua_bundle, read_lua_bundle  # noqa: E402
+
 ZIP_NAME = "Sentry-Ammo-Display.zip"
 # 版本号只写在 version.txt，清单里的显示名由构建时拼装，不手改。
 VERSION_FILE = ROOT / "version.txt"
@@ -20,8 +23,8 @@ PATCH = CORE / "9ba626afa44a3aa3.patch_0"
 
 CORE_LUA = "e02b68d623c30acd.lua"
 ADAPTER_LUA = "2d8169d01fdd078e.lua"
-CORE_ID = "cd0ac323d6682be0"
-ADAPTER_ID = "8e07dd1fd069812d"
+CORE_MODULE = "mods/sumitm/sentry_ammo_display/core"
+ADAPTER_MODULE = "mods/sumitm/sentry_ammo_display/mdl_adapter"
 LOADER_ID = "8f97174d125328ba"
 BOOT_ID = "fa95186993df76f4"
 LUA_TYPE = "e217d12cfa8d4ea1"
@@ -33,6 +36,8 @@ ALWAYS = ("manifest.json", "README.md", "thumbnail.png", "preview.png", "core/" 
           "core/ee6b1ba7e22d71ed.patch_0.gpu_resources",
           "core/ee6b1ba7e22d71ed.patch_0.stream")
 
+
+GROUP_MODULE_PREFIX = "mods/sumitm/sentry_ammo_display/group_"
 
 GROUPS = (
     ("ammo", "实弹哨戒", "机枪 / 加特林 / 自动 / 火箭 / 火焰",
@@ -72,29 +77,20 @@ def idstring64(text):
     return h.to_bytes(8, "little")
 
 
+# 归档里的行标签就是 addon 名的 IDString64，改名等于换行标签，两者必须同源。
+CORE_ID = idstring64(CORE_MODULE).hex()
+ADAPTER_ID = idstring64(ADAPTER_MODULE).hex()
+
+
 def build_archive(source: bytes, module: str) -> bytes:
-    header = bytearray(192)
-    struct.pack_into("<I", header, 0, 0xF0000011)
-    struct.pack_into("<I", header, 4, 1)
-    struct.pack_into("<I", header, 8, 1)
-    struct.pack_into("<Q", header, 0x20, 192 + 8 + len(source))
-    header[0x48:0x50] = bytes.fromhex(LUA_TYPE)
-    struct.pack_into("<I", header, 0x50, 1)
-    struct.pack_into("<I", header, 0x58, 16)
-    struct.pack_into("<I", header, 0x5C, 16)
-    row = 0x68
-    header[row:row + 8] = idstring64(module)
-    header[row + 8:row + 16] = bytes.fromhex(LUA_TYPE)
-    struct.pack_into("<I", header, row + 16, 192)
-    struct.pack_into("<I", header, row + 0x38, 8 + len(source))
-    return bytes(header) + struct.pack("<II", len(source), 2) + source
+    return build_lua_bundle(module, source)
 
 
 def group_marks():
     """每个组一个极小 patch：里面只有一条把组名写进全局表的 lua。"""
     out = []
     for key, label, detail, guid in GROUPS:
-        module = "mods/codex/sentry_group_" + key
+        module = GROUP_MODULE_PREFIX + key
         source = ("""-- HD2-Addon: %s
 local t=rawget(_G,'SENTRY_AMMO_GROUPS')
 if type(t)~='table' then t={};rawset(_G,'SENTRY_AMMO_GROUPS',t) end
@@ -103,7 +99,13 @@ t.%s=true
         folder = ROOT / "groups" / key
         folder.mkdir(parents=True, exist_ok=True)
         name = idstring64(module).hex() + ".patch_0"
-        (folder / name).write_bytes(build_archive(source, module))
+        archive = build_archive(source, module)
+        if read_lua_bundle(archive)[1] != source:
+            raise SystemExit("分组 %s 的归档读回来不是预期 lua" % key)
+        for stale in folder.iterdir():
+            if stale.name != name and stale.suffix != ".png":
+                stale.unlink()
+        (folder / name).write_bytes(archive)
         for suffix in (".gpu_resources", ".stream"):
             (folder / (name + suffix)).write_bytes(b"")
         out.append((key, label, detail, guid, "groups/%s/%s" % (key, name)))
@@ -119,7 +121,8 @@ def stamp_version():
     name = NAME_TEMPLATE % version
     if m.get("Name") != name:
         m["Name"] = name
-        path.write_text(json.dumps(m, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        path.write_text(json.dumps(m, ensure_ascii=False, indent=2) + "\n",
+                         encoding="utf-8", newline="")
     return version
 
 
@@ -195,6 +198,10 @@ def check(rt):
         raise SystemExit("入口仍引用自带加载器")
     if not adapter.startswith("-- HD2-Addon:"):
         raise SystemExit("入口缺少 HD2-Addon 声明")
+    if "mods/codex/" in adapter or "mods/codex/" in core:
+        raise SystemExit("lua 里还引用着上游命名空间")
+    if CORE_MODULE not in adapter or ADAPTER_MODULE not in adapter:
+        raise SystemExit("入口声明的 addon 名与行标签不同源")
 
     if rt is not None:
         for source, name in ((core, CORE_LUA), (adapter, ADAPTER_LUA)):
@@ -205,6 +212,18 @@ def check(rt):
     else:
         print("lua  : lupa 不可用，跳过编译检查")
     print("check: 归档 %d 个 lua 资源，boot 槽位已让出" % len(lua))
+
+    for key, *_ in GROUPS:
+        module = GROUP_MODULE_PREFIX + key
+        path = ROOT / "groups" / key / (idstring64(module).hex() + ".patch_0")
+        if not path.is_file():
+            raise SystemExit("分组 %s 缺少归档 %s" % (key, path.name))
+        rid, payload = read_lua_bundle(path.read_bytes())
+        if rid != int.from_bytes(idstring64(module), "little"):
+            raise SystemExit("分组 %s 的资源 id 对不上" % key)
+        if not payload.startswith(b"-- HD2-Addon: ") or ("t.%s=true" % key).encode() not in payload:
+            raise SystemExit("分组 %s 的 lua 不是预期内容" % key)
+    print("check: %d 个分组补丁的类型表与 lua 行均可用" % len(GROUPS))
 
 
 def apply_options(marks):
@@ -226,7 +245,8 @@ def apply_options(marks):
         })
     m["IconPath"] = "thumbnail.png"
     m["Options"] = options
-    path.write_text(json.dumps(m, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    path.write_text(json.dumps(m, ensure_ascii=False, indent=2) + "\n",
+                     encoding="utf-8", newline="")
 
 
 def make_zip(marks):

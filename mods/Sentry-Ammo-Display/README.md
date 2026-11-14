@@ -41,4 +41,4 @@ ESC → MDL3 设置 → MOD 设置 → 炮塔阵地弹药显示。字号、图�
 
 ## 日志
 
-`%LOCALAPPDATA%\SentryAmmoOverhead.log`，每次启动重写。
+`%LOCALAPPDATA%\SentryAmmoDisplay.log`，每次启动重写。

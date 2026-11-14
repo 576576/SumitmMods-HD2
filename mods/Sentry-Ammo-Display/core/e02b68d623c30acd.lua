@@ -1,4 +1,4 @@
-local SENTRY_ADDON='mods/codex/sentry_ammo_overhead'
+local SENTRY_ADDON='mods/sumitm/sentry_ammo_display/core'
 local ot=(function()
 local G=_G
 local S=G.stingray or G
@@ -11,7 +11,7 @@ local logfile=(function()
         local ok,value=pcall(os_.getenv,'LOCALAPPDATA')
         if ok and type(value)=='string' then dir=value..'\\' end
     end
-    local ok,file=pcall(G.io.open,dir..'SentryAmmoOverhead.log','w')
+    local ok,file=pcall(G.io.open,dir..'SentryAmmoDisplay.log','w')
     return ok and file or nil
 end)()
 local t,f=0,0
@@ -42,7 +42,7 @@ end,
 end)()
 local S=ot.engine
 local App,Unit=S.Application or {},S.Unit or {}
-local VERSION='1.4.5'
+local VERSION='1.5.6'
 local create_network = (function()
 -- Read-only ammunition/temperature and explicitly estimated Tesla lifetime provider.
 -- factory(ot, profile, identity) -> reset(world), sample(unit, model_hash), forget(unit),
@@ -1314,7 +1314,7 @@ return function(ot,profile)
     profile=type(profile)=='table' and profile or {}
     local S=type(ot.engine)=='table' and ot.engine or {}
     local App,World,Unit=S.Application or {},S.World or {},S.Unit or {}
-    local MAX_TARGETS,MAX_RAW_UNITS,MAX_RESOURCES=128,128,10
+    local MAX_TARGETS,MAX_RAW_UNITS,MAX_RESOURCES=128,128,32
     local resources,problem={},nil
     local world,frame,cached=nil,nil,nil
     local reason='no_world'
@@ -2601,8 +2601,8 @@ return {
     entity_data_sha256='c27d9d350b6f6138f9a040266d98958c8a755ef1b77e965d669c7b263178e15b',
     typelib_sha256='6cc78f1a8323d82cc319ba3f378b0dbf692f8ede3703cd0873f7e212ce11a18a',
     field_name='rounds_remaining', field_hash='d7a5d63e',
-    models={['2b11c9e4980ec479']=true,['37079568dc86e9c6']=true,['37cde43876ba26bb']=true,['51a0812e3bce2d74']=true,['56070f36cfffa8a8']=true,['61d9dda22a59e9bc']=true,['74599e56f72f9d7e']=true,['820cc3bafe962858']=true,['cbfe1fc7158347f3']=true,['0e977c49db7604f9']=true},
-    model_resources={['2b11c9e4980ec479']='content/fac_helldivers/hellpod/antitank_emplacement/antitank_emplacement',['37079568dc86e9c6']='content/fac_helldivers/hellpod/rocket_turret/rocket_turret',['37cde43876ba26bb']='content/fac_helldivers/hellpod/turret_machinegun_gpmg/turret_machinegun_gpmg',['51a0812e3bce2d74']='content/fac_helldivers/hellpod/mortar_turret/mortar_turret',['56070f36cfffa8a8']='content/fac_helldivers/hellpod/laser_cannon_turret/laser_cannon_turret',['61d9dda22a59e9bc']='content/fac_helldivers/hellpod/turret/turret',['74599e56f72f9d7e']='content/fac_helldivers/hellpod/tesla_turret/tesla_turret',['820cc3bafe962858']='content/fac_helldivers/hellpod/flamethrower_turret/flamethrower_turret',['cbfe1fc7158347f3']='content/fac_helldivers/hellpod/aa_turret/aa_turret',['0e977c49db7604f9']='content/fac_helldivers/hellpod/manned_turret/manned_turret'},
+    models={['2b11c9e4980ec479']=true,['37079568dc86e9c6']=true,['37cde43876ba26bb']=true,['51a0812e3bce2d74']=true,['56070f36cfffa8a8']=true,['61d9dda22a59e9bc']=true,['74599e56f72f9d7e']=true,['820cc3bafe962858']=true,['cbfe1fc7158347f3']=true,['e977c49db7604f9']=true},
+    model_resources={['2b11c9e4980ec479']='content/fac_helldivers/hellpod/antitank_emplacement/antitank_emplacement',['37079568dc86e9c6']='content/fac_helldivers/hellpod/rocket_turret/rocket_turret',['37cde43876ba26bb']='content/fac_helldivers/hellpod/turret_machinegun_gpmg/turret_machinegun_gpmg',['51a0812e3bce2d74']='content/fac_helldivers/hellpod/mortar_turret/mortar_turret',['56070f36cfffa8a8']='content/fac_helldivers/hellpod/laser_cannon_turret/laser_cannon_turret',['61d9dda22a59e9bc']='content/fac_helldivers/hellpod/turret/turret',['74599e56f72f9d7e']='content/fac_helldivers/hellpod/tesla_turret/tesla_turret',['820cc3bafe962858']='content/fac_helldivers/hellpod/flamethrower_turret/flamethrower_turret',['cbfe1fc7158347f3']='content/fac_helldivers/hellpod/aa_turret/aa_turret',['e977c49db7604f9']='content/fac_helldivers/hellpod/manned_turret/manned_turret'},
     types={
         {type_hash='0162dd9e',call='zdZ~yhg!',rounds_slot=39,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','6f3ab277','4cbcc2a2','7030c54e','b741b700','5e5865a0'}},
         {type_hash='13a71430',call='Es}/~kND',rounds_slot=39,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','6f3ab277','4cbcc2a2','7030c54e'}},
@@ -2635,12 +2635,12 @@ return {
         {model_hash='51a0812e3bce2d74',type_hash='ec516bbd',call='<j9*h3.S',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','6f3ab277','4cbcc2a2','7030c54e'}},
         {model_hash='61d9dda22a59e9bc',type_hash='6d3f8345',call='oYVe)p+i',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=3,position_semantics_verified=false,fields={'50ac6619','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','6f3ab277','4cbcc2a2','7030c54e','b741b700'}},
         {model_hash='37079568dc86e9c6',type_hash='be95e875',call='9I~t$THc',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','6f3ab277','4cbcc2a2','7030c54e'}},
-        {model_hash='0e977c49db7604f9',type_hash='f1dbc135',call='h:(x&X8#',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','c20428c6','6d1d5cfb','67526982','31182caf','3132608f','788b9753','99901914','1dd07f05','39d141d6','ac08fe53','7a4bdbbe','5dd8181b','b6347304','d7082cbf','6d2d83f8','7d9563dd','d8819b3e','49c250a6','31f86165','09d8bef4','6f3ab277','4cbcc2a2','7030c54e','95c46304','ec64918b','d7a5d63e','4a893e74','6fa852e3','c4c9b9ef'}},
+        {model_hash='e977c49db7604f9',type_hash='f1dbc135',call='h:(x&X8#',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','c20428c6','6d1d5cfb','67526982','31182caf','3132608f','788b9753','99901914','1dd07f05','39d141d6','ac08fe53','7a4bdbbe','5dd8181b','b6347304','d7082cbf','6d2d83f8','7d9563dd','d8819b3e','49c250a6','31f86165','09d8bef4','6f3ab277','4cbcc2a2','7030c54e','95c46304','ec64918b','d7a5d63e','4a893e74','6fa852e3','c4c9b9ef'}},
         {model_hash='56070f36cfffa8a8',type_hash='9d474323',call='Og,VB9b3',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','67526982','31182caf','ec64918b','a5023836','f6275c53','88b7cf6d'}},
-        {model_hash='0e977c49db7604f9',type_hash='bf35608c',call='Mm{:#c*%',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','67526982','31182caf','3132608f','788b9753','99901914','1dd07f05','39d141d6','ac08fe53','7a4bdbbe','5dd8181b','b6347304','d7082cbf','6d2d83f8','7d9563dd','d8819b3e','49c250a6','31f86165','09d8bef4','6f3ab277','4cbcc2a2','7030c54e','95c46304','ec64918b','d7a5d63e','4a893e74','6fa852e3','c4c9b9ef'}},
-        {model_hash='0e977c49db7604f9',type_hash='992ff297',call='G`Y1$voS',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','3132608f','788b9753','99901914','1dd07f05','39d141d6','ac08fe53','7a4bdbbe','5dd8181b','b6347304','d7082cbf','6d2d83f8','7d9563dd','d8819b3e','49c250a6','31f86165','09d8bef4','6f3ab277','4cbcc2a2','7030c54e','95c46304','ec64918b','d7a5d63e','4a893e74','6fa852e3'}},
+        {model_hash='e977c49db7604f9',type_hash='bf35608c',call='Mm{:#c*%',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','67526982','31182caf','3132608f','788b9753','99901914','1dd07f05','39d141d6','ac08fe53','7a4bdbbe','5dd8181b','b6347304','d7082cbf','6d2d83f8','7d9563dd','d8819b3e','49c250a6','31f86165','09d8bef4','6f3ab277','4cbcc2a2','7030c54e','95c46304','ec64918b','d7a5d63e','4a893e74','6fa852e3','c4c9b9ef'}},
+        {model_hash='e977c49db7604f9',type_hash='992ff297',call='G`Y1$voS',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','3132608f','788b9753','99901914','1dd07f05','39d141d6','ac08fe53','7a4bdbbe','5dd8181b','b6347304','d7082cbf','6d2d83f8','7d9563dd','d8819b3e','49c250a6','31f86165','09d8bef4','6f3ab277','4cbcc2a2','7030c54e','95c46304','ec64918b','d7a5d63e','4a893e74','6fa852e3'}},
         {model_hash='37cde43876ba26bb',type_hash='13a71430',call='Es}/~kND',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','6f3ab277','4cbcc2a2','7030c54e'}},
-        {model_hash='0e977c49db7604f9',type_hash='947ed108',call='JMR4x`Ao',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','3132608f','788b9753','99901914','1dd07f05','39d141d6','ac08fe53','7a4bdbbe','5dd8181b','b6347304','d7082cbf','6d2d83f8','7d9563dd','d8819b3e','49c250a6','31f86165','09d8bef4','7030c54e','95c46304','ec64918b','d7a5d63e','4a893e74','6fa852e3'}},
+        {model_hash='e977c49db7604f9',type_hash='947ed108',call='JMR4x`Ao',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','3132608f','788b9753','99901914','1dd07f05','39d141d6','ac08fe53','7a4bdbbe','5dd8181b','b6347304','d7082cbf','6d2d83f8','7d9563dd','d8819b3e','49c250a6','31f86165','09d8bef4','7030c54e','95c46304','ec64918b','d7a5d63e','4a893e74','6fa852e3'}},
         {model_hash='cbfe1fc7158347f3',type_hash='9fdd94c0',call='}>|mEsa.',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','6f3ab277','4cbcc2a2','7030c54e'}},
         {model_hash='cbfe1fc7158347f3',type_hash='a37f0894',call='$Leg(yqP',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','6f3ab277','4cbcc2a2','7030c54e'}},
         {model_hash='820cc3bafe962858',type_hash='3ae02f80',call='mZ(LD/!&',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','7030c54e'}},
@@ -2649,7 +2649,7 @@ return {
         {model_hash='51a0812e3bce2d74',type_hash='2363e364',call='T[tD_-{~',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','6f3ab277','4cbcc2a2','7030c54e'}},
         {model_hash='61d9dda22a59e9bc',type_hash='2596fa0a',call='N+d%Kq$1',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf'}},
         {model_hash='2b11c9e4980ec479',type_hash='3bd04c18',call='941ND^v~',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','67526982','31182caf','3132608f','788b9753','99901914','1dd07f05','39d141d6','ac08fe53','7a4bdbbe','5dd8181b','b6347304','d7082cbf','6d2d83f8','7d9563dd','d8819b3e','49c250a6','31f86165','09d8bef4','6f3ab277','4cbcc2a2','7030c54e','95c46304','ec64918b','d7a5d63e','4a893e74','6fa852e3','c4c9b9ef'}},
-        {model_hash='0e977c49db7604f9',type_hash='ee956607',call='<3hkntZ?',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','3132608f','788b9753','99901914','1dd07f05','39d141d6','ac08fe53','7a4bdbbe','5dd8181b','b6347304','d7082cbf','6d2d83f8','7d9563dd','d8819b3e','49c250a6','31f86165','09d8bef4','6f3ab277','4cbcc2a2','7030c54e','95c46304','ec64918b','d7a5d63e','4a893e74','6fa852e3'}},
+        {model_hash='e977c49db7604f9',type_hash='ee956607',call='<3hkntZ?',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','3132608f','788b9753','99901914','1dd07f05','39d141d6','ac08fe53','7a4bdbbe','5dd8181b','b6347304','d7082cbf','6d2d83f8','7d9563dd','d8819b3e','49c250a6','31f86165','09d8bef4','6f3ab277','4cbcc2a2','7030c54e','95c46304','ec64918b','d7a5d63e','4a893e74','6fa852e3'}},
         {model_hash='61d9dda22a59e9bc',type_hash='0162dd9e',call='zdZ~yhg!',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','e0a79052','9611c029','cc0b45e5','9d5d6cc7','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','6f3ab277','4cbcc2a2','7030c54e','b741b700','5e5865a0'}},
         {model_hash='74599e56f72f9d7e',type_hash='14c9c273',call='i1j-1MHz',position_field='c{i(uTh>',position_field_hash='9a9b14c4',position_slot=10,position_semantics_verified=false,fields={'50ac6619','dab52fe8','0565f571','169d5ed7','82830aed','cad5b537','9ddf0683','95417727','98b4aaf0','9a9b14c4','c336a25c','3ccffa7f','d22b948c','c20428c6','6d1d5cfb','a4c332a8','9bbb856e','b897e2d8','a1659a75','d5a66654','c4c9b9ef','d7082cbf','ac08fe53','7a4bdbbe','5dd8181b','b6347304','078c5d3b','60e13e87','49c250a6','31f86165','09d8bef4','3132608f','95c46304','ec64918b','d7a5d63e','4a893e74','67526982','31182caf','7030c54e'}},
     },
@@ -2662,19 +2662,22 @@ do
     local function alias(base,new,path)
         P.models[new]=true
         P.model_resources[new]=path
-        for i=1,#P.types do
-            local e=P.types[i]
-            if e.model_hash==base then
+        local n=0
+        for i=1,#P.bindings do
+            local b=P.bindings[i]
+            if b.model_hash==base then
                 local c={}
-                for k,v in pairs(e) do c[k]=v end
+                for k,v in pairs(b) do c[k]=v end
                 c.model_hash=new
-                P.types[#P.types+1]=c
-                return
+                P.bindings[#P.bindings+1]=c
+                n=n+1
             end
         end
-        error('alias base not found: '..base)
+        if n==0 then
+            ot.log('SENTRY-ALIAS no static binding for %s -> %s',base,path)
+        end
     end
-    alias('0e977c49db7604f9', '29ae906ea485a7fa', 'content/fac_helldivers/hellpod/expandable_cover/expandable_cover')
+    alias('e977c49db7604f9', '29ae906ea485a7fa', 'content/fac_helldivers/hellpod/expandable_cover/expandable_cover')
     alias('51a0812e3bce2d74', '299c0d3dfd2f0994', 'content/fac_helldivers/hellpod/mortar_turret/mortar_turret_gas')
     alias('51a0812e3bce2d74', 'b2053a1838092f8b', 'content/fac_helldivers/hellpod/mortar_turret/mortar_turret_staticfield')
 end
@@ -2684,7 +2687,7 @@ local GROUPS={
     mortar={'51a0812e3bce2d74','299c0d3dfd2f0994','b2053a1838092f8b'},
     laser={'56070f36cfffa8a8'},
     tesla={'74599e56f72f9d7e'},
-    emplacement={'0e977c49db7604f9','2b11c9e4980ec479','29ae906ea485a7fa'},
+    emplacement={'e977c49db7604f9','2b11c9e4980ec479','29ae906ea485a7fa'},
 }
 local groups_applied=false
 local function apply_groups()
@@ -2903,9 +2906,9 @@ return {
     text_alpha=185, icon_alpha=145, bar_alpha=145,
     max_distance=120, max_labels=32, head_offset=2.5,
     font='core/performance_hud/debug',
-    font_material='mods/codex/sentry_ammo/font_depth',
-    icon_material='mods/codex/sentry_ammo/icons_depth',
-    icon_texture='mods/codex/sentry_ammo/icons_atlas',
+    font_material='mods/sumitm/sentry_ammo_display/font_depth',
+    icon_material='mods/sumitm/sentry_ammo_display/icons_depth',
+    icon_texture='mods/sumitm/sentry_ammo_display/icons_atlas',
     bar_uv={u0=0.873046875,v0=0.873046875,u1=0.876953125,v1=0.876953125},
     frame_uv={u0=0.00390625,v0=0.75390625,u1=0.24609375,v1=0.99609375},
     icons={
@@ -3198,56 +3201,6 @@ module.update=function(dt)
     return update_core(dt)
 end
 return module
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 

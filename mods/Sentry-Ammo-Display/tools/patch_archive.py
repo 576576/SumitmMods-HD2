@@ -7,9 +7,13 @@
 """
 
 import struct
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT.parents[1] / "toolchain"))
+from hd2tool import idstring64  # noqa: E402
+
 SOURCE = ROOT / "tools" / "source" / "9ba626afa44a3aa3.orig.patch_0"
 TARGET = ROOT / "core" / "9ba626afa44a3aa3.patch_0"
 
@@ -19,13 +23,32 @@ CORE_ID = "cd0ac323d6682be0"
 BOOT_ID = "fa95186993df76f4"
 DROP = (LOADER_ID, BOOT_ID)
 
+# 行标签就是资源名的 IDString64。源归档里是上游的命名空间，落地时换成我们自己的。
+RELABEL = {
+    ADAPTER_ID: "mods/sumitm/sentry_ammo_display/mdl_adapter",
+    CORE_ID: "mods/sumitm/sentry_ammo_display/core",
+}
+
+# 材质与贴图同样在上游命名空间下。归档里它们不以名字出现，只有 8 字节名字哈希：
+# 行标签、材质集表、材质内部的贴图引用，所以整包做一次替换，只改行标签会拆散引用。
+RESOURCE_RENAMES = (
+    ("mods/codex/sentry_ammo/font_depth", "mods/sumitm/sentry_ammo_display/font_depth"),
+    ("mods/codex/sentry_ammo/icons_depth", "mods/sumitm/sentry_ammo_display/icons_depth"),
+    ("mods/codex/sentry_ammo/icons_atlas", "mods/sumitm/sentry_ammo_display/icons_atlas"),
+)
+# 这条材质在归档里只以哈希出现，原名字已无法反查；extra_depth 只为与其余三条同前缀。
+EXTRA_RESOURCE = ("9d0d9dbab1b40069", "mods/sumitm/sentry_ammo_display/extra_depth")
+
 HEADER = 72
 TYPE_ENTRY = 32
 ROW_SIZE = 80
 PAYLOAD_START = 1024
 ALIGN = 16
-# 核心这一行由我们自己定长度（原包 188,996 是原作者的排版，不是限制）。
-GROW = {CORE_ID: 204_800}
+# 核心这一行的槽位由我们自己定（原包长度是原作者的排版，不是限制），与 patch_core.SLOT 同源。
+sys.path.insert(0, str(ROOT / "tools"))
+from patch_core import SLOT as CORE_SLOT  # noqa: E402
+
+GROW = {CORE_ID: CORE_SLOT, ADAPTER_ID: 4_096}
 
 
 def u32(buf, offset):
@@ -71,6 +94,35 @@ def packed(source, size):
     return struct.pack("<II", len(data), 2) + data + b"\n" * (size - 8 - len(data))
 
 
+def resource_swaps():
+    """旧资源名哈希 → 新资源名哈希（小端 8 字节，与归档里的写法一致）。"""
+    swaps = {}
+    for old, new in RESOURCE_RENAMES:
+        swaps[idstring64(old).to_bytes(8, "little")] = idstring64(new).to_bytes(8, "little")
+    old_hash, new_name = EXTRA_RESOURCE
+    swaps[bytes.fromhex(old_hash)] = idstring64(new_name).to_bytes(8, "little")
+    return swaps
+
+
+def rename_resources(buf, kept):
+    swaps = resource_swaps()
+    before = {old: buf.count(old) for old in swaps}
+    for old, new in swaps.items():
+        if not before[old]:
+            raise SystemExit("归档里找不到要改名的资源：%s" % old.hex())
+        buf = buf.replace(old, new)
+    for old, new in swaps.items():
+        if buf.count(old):
+            raise SystemExit("资源名哈希没换干净：%s" % old.hex())
+        if buf.count(new) != before[old]:
+            raise SystemExit("资源名哈希替换数量不一致：%s" % new.hex())
+    for row in kept:
+        swap = swaps.get(bytes.fromhex(row["id"]))
+        if swap:
+            row["id"] = swap.hex()
+    return buf
+
+
 def rebuild(entries, rows):
     kept = [row for row in rows if row["id"] not in DROP]
     dropped = [row["id"] for row in rows if row["id"] in DROP]
@@ -88,6 +140,12 @@ def rebuild(entries, rows):
             row["payload"] = packed(sources[row["id"]], row["size"])
             print("%-9s %d bytes / slot %d" % (row["id"][:8], len(row["payload"]) - 8 + 8,
                                                row["size"]))
+
+    for row in kept:
+        module = RELABEL.get(row["id"])
+        if module:
+            struct.pack_into("<Q", row["raw"], 0, idstring64(module))
+            row["id"] = idstring64(module).to_bytes(8, "little").hex()
 
     counts = {}
     for row in kept:
@@ -122,6 +180,7 @@ def rebuild(entries, rows):
     out.extend(row_bytes)
     out.extend(b"\0" * (body_start - len(out)))
     out.extend(payloads)
+    out = rename_resources(out, kept)
     return bytes(out), kept, dropped
 
 
